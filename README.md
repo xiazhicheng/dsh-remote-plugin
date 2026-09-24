@@ -1,4 +1,4 @@
-# dsh-llm-retry-boost
+# dsh-remote-plugin
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that **boosts model-request retries** for unstable or rate-limited LLM endpoints.
 
@@ -36,8 +36,8 @@ Retries are not logged as separate `llm/retry` session events (that durability i
 ### From a local clone (recommended for development)
 
 ```bash
-git clone https://github.com/<you>/dsh-llm-retry-boost.git
-cd dsh-llm-retry-boost
+git clone https://github.com/<you>/dsh-remote-plugin.git
+cd dsh-remote-plugin
 pnpm install            # optional: only needed to rebuild lib/ from src/
 pnpm build              # optional: regenerates lib/ (already committed)
 ```
@@ -45,7 +45,7 @@ pnpm build              # optional: regenerates lib/ (already committed)
 Then in DSH, install the bundle from the absolute package directory:
 
 ```
-plugin_manager → install_bundle → target: /absolute/path/to/dsh-llm-retry-boost
+plugin_manager → install_bundle → target: /absolute/path/to/dsh-remote-plugin
 ```
 
 The repo **commits `lib/`**, so the bundle loads without a build step and without pnpm build-script approval.
@@ -59,8 +59,8 @@ Point `plugin_manager` `install_bundle` at the GitHub URL; DSH runs `pnpm add` a
 The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). Edit `config` there (HMR applies changes live in YAML-enabled profiles), or change it in Settings → Plugins:
 
 ```yaml
-- id: llm-retry-boost
-  name: dsh-llm-retry-boost
+- id: remote-plugin
+  name: dsh-remote-plugin
   config:
     mode: always                 # 'always' (default, no limit) | 'normal' (honor maxRetries)
     maxRetries: 50               # normal-mode budget after the first request (default 50)
@@ -124,8 +124,8 @@ Use this plugin when you want the boost **regardless of each provider's own poli
 ## Repository layout
 
 ```
-dsh-llm-retry-boost/
-├── cordis.patch.yml      # Loader patch: installs the llm-retry-boost plugin row + defaults
+dsh-remote-plugin/
+├── cordis.patch.yml      # Loader patch: installs the remote-plugin plugin row + defaults
 ├── icon.svg              # Plugin Manager card icon
 ├── lib/                  # Committed build output (loads without a build step)
 │   ├── index.js          # Host plugin: the agent/request-error recovery listener

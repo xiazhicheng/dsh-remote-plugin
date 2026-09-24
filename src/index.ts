@@ -1,5 +1,5 @@
 /**
- * dsh-llm-retry-boost — boost model-request retries on the agent loop's
+ * dsh-remote-plugin — boost model-request retries on the agent loop's
  * `agent/request-error` waterfall.
  *
  * Mount this bundle when your LLM endpoint is unstable or rate-limited and the
@@ -14,14 +14,14 @@
  * This plugin keeps its own per-step retry count in memory and never registers
  * a duplicate session projection, so it is safe to mount alongside it.
  *
- * @module dsh-llm-retry-boost
+ * @module dsh-remote-plugin
  */
 import z from '@deepseek-ai/schemastery';
 import type { Context } from '@deepseek-ai/cordis';
 import type { LlmFailure } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 
-export const name = 'llm-retry-boost';
+export const name = 'remote-plugin';
 export const inject = ['agents'];
 
 /** Largest delay a single `setTimeout` can accept (2^31 - 1 ms). */
@@ -231,7 +231,7 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
 
     counts.set(provider, attempt);
     ctx.logger.info(
-      'llm-retry-boost: provider "%s" %s retry #%d after %dms (code %s)',
+      'remote-plugin: provider "%s" %s retry #%d after %dms (code %s)',
       provider,
       resolved.mode,
       attempt,
@@ -258,9 +258,9 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
   ctx.effect(
     () => async () => {
       disposeListener();
-      lifetime.abort(new Error('llm-retry-boost disposed'));
+      lifetime.abort(new Error('remote-plugin disposed'));
       await Promise.allSettled([...active]);
     },
-    'llm-retry-boost: abort and drain active recovery',
+    'remote-plugin: abort and drain active recovery',
   );
 }

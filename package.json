@@ -1,5 +1,5 @@
 {
-  "name": "dsh-llm-retry-boost",
+  "name": "dsh-remote-plugin",
   "version": "0.1.0",
   "description": "DSH plugin that boosts model-request retries to 50 (or unlimited always-mode) on the agent/request-error waterfall — for unstable or rate-limited remote LLM endpoints.",
   "private": false,
