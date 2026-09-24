@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { LlmFailure } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 
-export declare const name = 'remote-plugin';
+export declare const name = 'retry-llm-plugin';
 export declare const inject = ['agents'];
 
 /** Bounded exponential backoff with symmetric jitter around each local delay. */

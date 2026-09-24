@@ -1,4 +1,4 @@
-# dsh-remote-plugin
+# dsh-retry-llm-plugin
 
 English | [中文](README.zh.md)
 
@@ -38,8 +38,8 @@ Retries are not logged as separate `llm/retry` session events (that durability i
 ### From a local clone (recommended for development)
 
 ```bash
-git clone https://github.com/<you>/dsh-remote-plugin.git
-cd dsh-remote-plugin
+git clone https://github.com/<you>/dsh-retry-llm-plugin.git
+cd dsh-retry-llm-plugin
 pnpm install            # optional: only needed to rebuild lib/ from src/
 pnpm build              # optional: regenerates lib/ (already committed)
 ```
@@ -47,7 +47,7 @@ pnpm build              # optional: regenerates lib/ (already committed)
 Then in DSH, install the bundle from the absolute package directory:
 
 ```
-plugin_manager → install_bundle → target: /absolute/path/to/dsh-remote-plugin
+plugin_manager → install_bundle → target: /absolute/path/to/dsh-retry-llm-plugin
 ```
 
 The repo **commits `lib/`**, so the bundle loads without a build step and without pnpm build-script approval.
@@ -61,8 +61,8 @@ Point `plugin_manager` `install_bundle` at the GitHub URL; DSH runs `pnpm add` a
 The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). Edit `config` there (HMR applies changes live in YAML-enabled profiles), or change it in Settings → Plugins:
 
 ```yaml
-- id: remote-plugin
-  name: dsh-remote-plugin
+- id: retry-llm-plugin
+  name: dsh-retry-llm-plugin
   config:
     mode: always                 # 'always' (default, no limit) | 'normal' (honor maxRetries)
     maxRetries: 50               # normal-mode budget after the first request (default 50)
@@ -126,8 +126,8 @@ Use this plugin when you want the boost **regardless of each provider's own poli
 ## Repository layout
 
 ```
-dsh-remote-plugin/
-├── cordis.patch.yml      # Loader patch: installs the remote-plugin plugin row + defaults
+dsh-retry-llm-plugin/
+├── cordis.patch.yml      # Loader patch: installs the retry-llm-plugin plugin row + defaults
 ├── icon.svg              # Plugin Manager card icon
 ├── lib/                  # Committed build output (loads without a build step)
 │   ├── index.js          # Host plugin: the agent/request-error recovery listener

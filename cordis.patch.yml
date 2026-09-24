@@ -1,9 +1,9 @@
-# Loader patch for the dsh-remote-plugin bundle.
+# Loader patch for the dsh-retry-llm-plugin bundle.
 # Installs one Host plugin entry. The row name must match the package name.
 # Tune behavior under `config`; see README for every option.
 - insert:
-    - id: remote-plugin
-      name: dsh-remote-plugin
+    - id: retry-llm-plugin
+      name: dsh-retry-llm-plugin
       config:
         mode: always
         maxRetries: 50

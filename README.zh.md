@@ -1,4 +1,4 @@
-# dsh-remote-plugin
+# dsh-retry-llm-plugin
 
 [English](README.md) | 中文
 
@@ -36,8 +36,8 @@ DSH 在 `agent/request-error` 瀑布流上执行 provider 重试策略——这�
 ### 本地 clone（开发推荐）
 
 ```bash
-git clone https://github.com/<你>/dsh-remote-plugin.git
-cd dsh-remote-plugin
+git clone https://github.com/<你>/dsh-retry-llm-plugin.git
+cd dsh-retry-llm-plugin
 pnpm install            # 可选：仅当要从 src/ 重建 lib/ 时需要
 pnpm build              # 可选：重新生成 lib/（已提交）
 ```
@@ -45,7 +45,7 @@ pnpm build              # 可选：重新生成 lib/（已提交）
 然后在 DSH 中用绝对路径安装 bundle：
 
 ```
-plugin_manager → install_bundle → target: /绝对路径/dsh-remote-plugin
+plugin_manager → install_bundle → target: /绝对路径/dsh-retry-llm-plugin
 ```
 
 仓库**已提交 `lib/`**，所以 bundle 无需构建步骤、无需 pnpm build-script 审批即可加载。
@@ -59,8 +59,8 @@ plugin_manager → install_bundle → target: /绝对路径/dsh-remote-plugin
 [`cordis.patch.yml`](cordis.patch.yml) 里已带合理默认值。在那里编辑 `config`（启用 HMR 的 profile 改动即时生效），或在 设置 → 插件 中改：
 
 ```yaml
-- id: remote-plugin
-  name: dsh-remote-plugin
+- id: retry-llm-plugin
+  name: dsh-retry-llm-plugin
   config:
     mode: always                 # 'always'（默认，无限）| 'normal'（遵循 maxRetries）
     maxRetries: 50               # normal 模式下首次请求之后的重试预算（默认 50）
@@ -124,8 +124,8 @@ plugin_manager → install_bundle → target: /绝对路径/dsh-remote-plugin
 ## 仓库结构
 
 ```
-dsh-remote-plugin/
-├── cordis.patch.yml      # Loader patch：安装 remote-plugin 插件行 + 默认值
+dsh-retry-llm-plugin/
+├── cordis.patch.yml      # Loader patch：安装 retry-llm-plugin 插件行 + 默认值
 ├── icon.svg              # 插件管理器卡片图标
 ├── lib/                  # 已提交的构建产物（无需构建即可加载）
 │   ├── index.js          # Host 插件：agent/request-error 恢复监听器

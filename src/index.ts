@@ -1,33 +1,12 @@
-/**
- * dsh-remote-plugin — boost model-request retries on the agent loop's
- * `agent/request-error` waterfall.
- *
- * Mount this bundle when your LLM endpoint is unstable or rate-limited and the
- * default normal-mode retry budget (5) ends turns too eagerly. It installs an
- * additional recovery listener that retries failed model requests either a
- * configurable finite number of times (`normal`, default 50) or without an
- * attempt limit (`always`, the default), stopping only on success, turn
- * cancellation, or plugin disposal.
- *
- * It cooperates with the built-in `@deepseek-ai/dsh-llm-retry`: both listen on
- * the same waterfall, and whichever owns a given retry returns `{ kind: 'retry' }`.
- * This plugin keeps its own per-step retry count in memory and never registers
- * a duplicate session projection, so it is safe to mount alongside it.
- *
- * @module dsh-remote-plugin
- */
+// Source of truth. Build to lib/index.js with `pnpm build`.
 import z from '@deepseek-ai/schemastery';
-import type { Context } from '@deepseek-ai/cordis';
-import type { LlmFailure } from '@deepseek-ai/dsh-llm';
-import type { Agent } from '@deepseek-ai/dsh-agent';
+import { randomUUID } from 'node:crypto';
 
-export const name = 'remote-plugin';
-export const inject = ['agents'];
+export const name = 'retry-llm-plugin';
+export const inject = ['agents', 'sessionProjections'];
 
-/** Largest delay a single `setTimeout` can accept (2^31 - 1 ms). */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
-/** Transient failure codes retried by DSH's normal-mode default policy. */
 const DEFAULT_RETRYABLE_CODES = Object.freeze([
   'EMPTY_RESPONSE',
   'RATE_LIMIT',
@@ -36,11 +15,6 @@ const DEFAULT_RETRYABLE_CODES = Object.freeze([
   'TRANSPORT',
 ]);
 
-/**
- * Failure codes that never succeed on a plain retry, or are owned by other
- * recovery policies (context overflow, image offload). Excluded even in
- * `always` mode so the plugin does not hammer a fundamentally broken route.
- */
 const DEFAULT_EXCLUDE_CODES = Object.freeze([
   'AUTH',
   'MISSING_CREDENTIAL',
@@ -52,29 +26,18 @@ const DEFAULT_EXCLUDE_CODES = Object.freeze([
   'REGISTRATION_DISPOSED',
 ]);
 
-/** Bounded exponential backoff with symmetric jitter around each local delay. */
-export interface BackoffConfig {
-  /** Initial local delay in milliseconds (default 500). */
+interface BackoffConfig {
   initialDelayMs?: number;
-  /** Maximum locally scheduled or accepted delay in milliseconds (default 30000). */
   maxDelayMs?: number;
-  /** Symmetric random multiplier range around one (default 0.2). */
   jitterRatio?: number;
 }
 
-/** Plugin configuration. */
-export interface RetryBoostConfig {
-  /** `always` retries every eligible failure without a limit; `normal` honors `maxRetries`. Default `always`. */
-  mode?: 'always' | 'normal';
-  /** Maximum eligible retries after the first request in `normal` mode (default 50). */
+export interface ConfigSchema {
+  mode?: string;
   maxRetries?: number;
-  /** Stable failure codes eligible for retry in `normal` mode (default transient set). */
   retryableCodes?: string[];
-  /** Codes never retried, even in `always` mode (default permanent / owned-elsewhere set). */
   excludeCodes?: string[];
-  /** Local exponential-backoff and jitter configuration. */
   backoff?: BackoffConfig;
-  /** Honor a valid provider `Retry-After` when it fits `maxDelayMs` (default true). */
   respectProviderRetryAfter?: boolean;
 }
 
@@ -91,42 +54,23 @@ export const Config = z.object({
   respectProviderRetryAfter: z.boolean().default(true),
 });
 
-/** A recovery decision returned from the `agent/request-error` waterfall. */
-type RequestErrorAction = { kind: 'retry' } | undefined;
-
-/** Payload of the `agent/request-error` waterfall (the fields this plugin uses). */
-interface RequestErrorPayload {
-  agent: Agent;
-  turn: number;
-  step: number;
-  provider: string;
-  failure: LlmFailure;
-  signal: AbortSignal;
+interface ResolvedConfig {
+  mode: 'always' | 'normal';
+  maxRetries: number;
+  retryableCodes: readonly string[];
+  excludeCodes: readonly string[];
+  respectProviderRetryAfter: boolean;
+  backoff: BackoffConfig & Required<BackoffConfig>;
 }
 
-interface ResolvedBackoff {
-  readonly initialDelayMs: number;
-  readonly maxDelayMs: number;
-  readonly jitterRatio: number;
-}
-
-interface ResolvedBoostConfig {
-  readonly mode: 'always' | 'normal';
-  readonly maxRetries: number;
-  readonly retryableCodes: readonly string[];
-  readonly excludeCodes: readonly string[];
-  readonly backoff: ResolvedBackoff;
-  readonly respectProviderRetryAfter: boolean;
-}
-
-function resolveConfig(config: RetryBoostConfig): ResolvedBoostConfig {
-  const b = config.backoff ?? {};
+function resolveConfig(config?: ConfigSchema): ResolvedConfig {
+  const b = config?.backoff ?? {};
   return {
-    mode: config.mode === 'normal' ? 'normal' : 'always',
-    maxRetries: typeof config.maxRetries === 'number' ? config.maxRetries : 50,
-    retryableCodes: config.retryableCodes ?? DEFAULT_RETRYABLE_CODES,
-    excludeCodes: config.excludeCodes ?? DEFAULT_EXCLUDE_CODES,
-    respectProviderRetryAfter: config.respectProviderRetryAfter !== false,
+    mode: config?.mode === 'normal' ? 'normal' : 'always',
+    maxRetries: typeof config?.maxRetries === 'number' ? config.maxRetries : 50,
+    retryableCodes: config?.retryableCodes ?? DEFAULT_RETRYABLE_CODES,
+    excludeCodes: config?.excludeCodes ?? DEFAULT_EXCLUDE_CODES,
+    respectProviderRetryAfter: config?.respectProviderRetryAfter !== false,
     backoff: {
       initialDelayMs: b.initialDelayMs ?? 500,
       maxDelayMs: b.maxDelayMs ?? 30000,
@@ -135,18 +79,16 @@ function resolveConfig(config: RetryBoostConfig): ResolvedBoostConfig {
   };
 }
 
-/** Bounded exponential backoff with symmetric jitter, matching the built-in policy. */
-function localDelay(b: ResolvedBackoff, retry: number, random: () => number): number {
+function localDelay(b: BackoffConfig & Required<BackoffConfig>, retry: number, random: () => number): number {
   const exponent = Math.min(retry - 1, 1024);
   const exponential = Math.min(b.initialDelayMs * 2 ** exponent, b.maxDelayMs);
   const jitter = 1 - b.jitterRatio + 2 * b.jitterRatio * random();
   return Math.min(exponential * jitter, b.maxDelayMs);
 }
 
-/** Wait `delayMs`, resolving `true` unless `signal` aborted first. */
 function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
-  return new Promise<boolean>((resolve) => {
+  return new Promise((resolve) => {
     const timer = setTimeout(() => {
       signal.removeEventListener('abort', onAbort);
       resolve(true);
@@ -159,27 +101,42 @@ function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<boolean
   });
 }
 
-/** In-memory per-step retry counter, keyed by agent object identity. */
-interface StepState {
+interface RequestErrorPayload {
+  agent: { session: { append: (type: string, data: unknown) => void } };
   turn: number;
   step: number;
-  counts: Map<string, number>;
+  provider: string;
+  failure: {
+    code: string;
+    message?: string;
+    status?: number;
+    providerRetryAfterMs?: number;
+    [key: string]: unknown;
+  };
+  signal: AbortSignal;
+  [key: string]: unknown;
 }
 
-/**
- * Install the boost recovery listener.
- *
- * @param ctx - plugin context that owns the listener and active waits.
- * @param config - resolved by {@link Config}; omission selects `always` mode.
- */
-export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
+export function apply(
+  ctx: {
+    logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
+    on: (event: string, fn: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>) => () => void;
+    effect: (fn: () => Promise<() => Promise<void>>, label: string) => void;
+  },
+  config: ConfigSchema = {},
+): void {
   const resolved = resolveConfig(config);
+  ctx.logger.info(
+    'retry-llm-plugin: activated (mode: %s, maxRetries: %d)',
+    resolved.mode,
+    resolved.maxRetries,
+  );
   const random = Math.random;
   const lifetime = new AbortController();
-  const active = new Set<Promise<RequestErrorAction>>();
-  const states = new WeakMap<Agent, StepState>();
+  const active = new Set<Promise<unknown>>();
+  const states = new WeakMap<object, { turn: number; step: number; counts: Map<string, number> }>();
 
-  function stepCounts(agent: Agent, turn: number, step: number): Map<string, number> {
+  function stepCounts(agent: object, turn: number, step: number): Map<string, number> {
     let st = states.get(agent);
     if (!st || st.turn !== turn || st.step !== step) {
       st = { turn, step, counts: new Map() };
@@ -194,10 +151,7 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
     return resolved.retryableCodes.includes(code);
   }
 
-  async function recover(
-    payload: RequestErrorPayload,
-    next: () => Promise<RequestErrorAction>,
-  ): Promise<RequestErrorAction> {
+  async function recover(payload: RequestErrorPayload, next: () => Promise<unknown>): Promise<unknown> {
     const { agent, turn, step, provider, failure, signal } = payload;
     const fused = AbortSignal.any([signal, lifetime.signal]);
     if (fused.aborted) return next();
@@ -217,9 +171,6 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
       pra > 0
     ) {
       if (pra > resolved.backoff.maxDelayMs) {
-        // Provider wants to wait longer than we allow. In normal mode defer;
-        // in always mode fall back to local backoff so the policy never
-        // terminates on a provider delay instruction.
         if (resolved.mode === 'normal') return next();
         delayMs = localDelay(resolved.backoff, attempt, random);
       } else {
@@ -231,7 +182,7 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
 
     counts.set(provider, attempt);
     ctx.logger.info(
-      'remote-plugin: provider "%s" %s retry #%d after %dms (code %s)',
+      'retry-llm-plugin: provider "%s" %s retry #%d after %dms (code %s)',
       provider,
       resolved.mode,
       attempt,
@@ -239,28 +190,56 @@ export function apply(ctx: Context, config: RetryBoostConfig = {}): void {
       failure.code,
     );
 
+    // Emit llm/retry event so this retry is visible in the session log and UI.
+    const retryId = randomUUID();
+    try {
+      agent.session.append('llm/retry', {
+        retryId,
+        turn,
+        step,
+        provider,
+        mode: resolved.mode,
+        policyKey: 'retryBoost',
+        retry: attempt,
+        delayMs,
+        failure,
+      });
+    } catch (e) {
+      ctx.logger.warn('retry-llm-plugin: failed to append llm/retry event: %o', e);
+    }
+
     if (!(await cancellableDelay(delayMs, fused))) return next();
     if (fused.aborted) return next();
+
+    // Mark the retry as actually starting (mirrors dsh-llm-retry's llm/retry-started).
+    try {
+      agent.session.append('llm/retry-started', {
+        retryId,
+        turn,
+        step,
+        retry: attempt,
+      });
+    } catch (e) {
+      ctx.logger.warn('retry-llm-plugin: failed to append llm/retry-started event: %o', e);
+    }
+
     return { kind: 'retry' };
   }
 
-  const disposeListener = ctx.on(
-    'agent/request-error',
-    (payload: RequestErrorPayload, next: () => Promise<RequestErrorAction>) => {
-      if (lifetime.signal.aborted) return Promise.resolve(undefined);
-      const tracked = recover(payload, next);
-      active.add(tracked);
-      tracked.finally(() => active.delete(tracked));
-      return tracked;
-    },
-  );
+  const disposeListener = ctx.on('agent/request-error', (payload: RequestErrorPayload, next: () => Promise<unknown>) => {
+    if (lifetime.signal.aborted) return Promise.resolve(undefined);
+    const tracked = recover(payload, next);
+    active.add(tracked);
+    tracked.finally(() => active.delete(tracked));
+    return tracked;
+  });
 
   ctx.effect(
     () => async () => {
       disposeListener();
-      lifetime.abort(new Error('remote-plugin disposed'));
+      lifetime.abort(new Error('retry-llm-plugin disposed'));
       await Promise.allSettled([...active]);
     },
-    'remote-plugin: abort and drain active recovery',
+    'retry-llm-plugin: abort and drain active recovery',
   );
 }
