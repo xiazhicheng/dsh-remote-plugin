@@ -6,6 +6,9 @@ node_modules/
 # step. Do NOT add lib/ to this file.
 *.tsbuildinfo
 
+# Temp commit-message scratch files
+/.commit-msg.txt
+
 # Logs / editor / OS
 *.log
 .DS_Store
