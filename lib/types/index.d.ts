@@ -14,6 +14,16 @@ export interface BackoffConfig {
   jitterRatio?: number;
 }
 
+/** SSH remote-development connection settings. */
+export interface SshConfig {
+  host?: string;
+  port?: number;
+  username?: string;
+  identityFile?: string;
+  password?: string;
+  remoteDir?: string;
+}
+
 /** Plugin configuration. */
 export interface RetryBoostConfig {
   mode?: 'always' | 'normal';
@@ -22,6 +32,7 @@ export interface RetryBoostConfig {
   excludeCodes?: string[];
   backoff?: BackoffConfig;
   respectProviderRetryAfter?: boolean;
+  ssh?: SshConfig;
 }
 
 export declare const Config: z<RetryBoostConfig>;
