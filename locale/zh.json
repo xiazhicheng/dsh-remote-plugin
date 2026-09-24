@@ -1,0 +1,4 @@
+{
+  "title": "LLM 重试增强",
+  "description": "在 agent/request-error 恢复瀑布流上将不稳定或被限流的模型请求重试最多 50 次，或 always 模式下持续重试直到成功。"
+}

@@ -1,0 +1,14 @@
+# Loader patch for the dsh-llm-retry-boost bundle.
+# Installs one Host plugin entry. The row name must match the package name.
+# Tune behavior under `config`; see README for every option.
+- insert:
+    - id: llm-retry-boost
+      name: dsh-llm-retry-boost
+      config:
+        mode: always
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+        respectProviderRetryAfter: true

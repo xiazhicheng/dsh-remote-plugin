@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build artifacts NOT committed are ignored here.
+# NOTE: lib/ is intentionally committed so the bundle installs without a build
+# step. Do NOT add lib/ to this file.
+*.tsbuildinfo
+
+# Logs / editor / OS
+*.log
+.DS_Store
+.idea/
+.vscode/
