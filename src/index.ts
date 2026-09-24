@@ -182,7 +182,7 @@ function sshWrite(client: Client, remotePath: string, content: string): Promise<
 
 function jsonOutput(schema: Record<string, unknown>) {
   return {
-    schema,
+    schema: { ...schema, additionalProperties: false },
     render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
   };
 }
