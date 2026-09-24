@@ -1,5 +1,7 @@
 # dsh-remote-plugin
 
+English | [中文](README.zh.md)
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that **boosts model-request retries** for unstable or rate-limited LLM endpoints.
 
 When your LLM is flaky — frequent `429`/`RATE_LIMIT`, `5xx`/`SERVER`, timeouts, empty responses — the built-in recovery ends the turn after just **5 retries**. This plugin installs an additional listener on the agent loop's `agent/request-error` recovery waterfall that retries **50 times** by default, or **forever** in `always` mode, stopping only on success, turn cancellation, or plugin disposal.
@@ -141,7 +143,7 @@ dsh-remote-plugin/
 ├── package.json          # Bundle manifest: dsh.bundle.patch, exports, icon, devDeps
 ├── README.md             # This file (English)
 ├── README.zh.md          # 中文说明
-├── LICENSE               # MIT
+├── LICENSE               # Apache-2.0
 └── .gitignore
 ```
 

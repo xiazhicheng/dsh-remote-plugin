@@ -141,7 +141,7 @@ dsh-remote-plugin/
 ├── package.json          # bundle 清单：dsh.bundle.patch、exports、icon、devDeps
 ├── README.md             # 英文说明
 ├── README.zh.md          # 本文件（中文）
-├── LICENSE               # MIT
+├── LICENSE               # Apache-2.0
 └── .gitignore
 ```
 
