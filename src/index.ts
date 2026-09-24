@@ -314,7 +314,7 @@ export function apply(
       description: 'Execute a shell command on the remote SSH server and return stdout, stderr, and exit code.',
       parameters: {
         command: { type: 'string' as const, required: true, description: 'Shell command to execute on the remote server.' },
-        timeoutMs: { type: 'number' as const, required: false, description: 'Timeout in milliseconds. Defaults to 30000.' },
+        timeoutMs: { type: 'number' as const, description: 'Timeout in milliseconds. Defaults to 30000.' },
       },
       output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
       execute(args: { command: string; timeoutMs?: number }) {
