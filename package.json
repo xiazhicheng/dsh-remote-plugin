@@ -1,5 +1,5 @@
 {
-  "name": "dsh-retry-llm-plugin",
+  "name": "dsh-remote-retry-llm-plugin",
   "version": "0.1.0",
   "description": "DSH plugin for SSH remote development (exec/read/write tools) with boosted LLM retries — for unstable or rate-limited remote LLM endpoints.",
   "private": false,

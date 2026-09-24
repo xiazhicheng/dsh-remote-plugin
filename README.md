@@ -1,4 +1,4 @@
-# dsh-retry-llm-plugin
+# dsh-remote-retry-llm-plugin
 
 English | [中文](README.zh.md)
 
@@ -65,8 +65,8 @@ The SSH connection is established lazily on first tool call and cached for the p
 ### From a local clone (recommended for development)
 
 ```bash
-git clone https://github.com/<you>/dsh-retry-llm-plugin.git
-cd dsh-retry-llm-plugin
+git clone https://github.com/<you>/dsh-remote-retry-llm-plugin.git
+cd dsh-remote-retry-llm-plugin
 pnpm install            # optional: only needed to rebuild lib/ from src/
 pnpm build              # optional: regenerates lib/ (already committed)
 ```
@@ -74,7 +74,7 @@ pnpm build              # optional: regenerates lib/ (already committed)
 Then in DSH, install the bundle from the absolute package directory:
 
 ```
-plugin_manager → install_bundle → target: /absolute/path/to/dsh-retry-llm-plugin
+plugin_manager → install_bundle → target: /absolute/path/to/dsh-remote-retry-llm-plugin
 ```
 
 The repo **commits `lib/`**, so the bundle loads without a build step and without pnpm build-script approval.
@@ -89,7 +89,7 @@ The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). 
 
 ```yaml
 - id: retry-llm-plugin
-  name: dsh-retry-llm-plugin
+  name: dsh-remote-retry-llm-plugin
   config:
     mode: always                 # 'always' (default, no limit) | 'normal' (honor maxRetries)
     maxRetries: 50               # normal-mode budget after the first request (default 50)
@@ -168,7 +168,7 @@ Use this plugin when you want the boost **regardless of each provider's own poli
 ## Repository layout
 
 ```
-dsh-retry-llm-plugin/
+dsh-remote-retry-llm-plugin/
 ├── cordis.patch.yml      # Loader patch: installs the retry-llm-plugin plugin row + defaults
 ├── icon.svg              # Plugin Manager card icon
 ├── lib/                  # Committed build output (loads without a build step)
