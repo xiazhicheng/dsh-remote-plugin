@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，为**不稳定或被限流的 LLM 端点增强模型请求重试**。
+一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，提供 **SSH 远程开发工具**（exec/read/write）并**增强 LLM 重试**至 50+ 次。
 
 当你的 LLM 不稳定——频繁 `429`/`RATE_LIMIT`、`5xx`/`SERVER`、超时、空响应——内置重试只重试 **5 次**就结束本轮。本插件在 agent loop 的 `agent/request-error` 恢复瀑布流上额外挂一个监听器，默认重试 **50 次**，或在 `always` 模式下**无限重试**，只在成功、本轮取消或插件卸载时停止。
 
@@ -29,7 +29,34 @@ DSH 在 `agent/request-error` 瀑布流上执行 provider 重试策略——这�
 
 两个插件按瀑布流顺序协作：谁拥有某次重试就返回 `{ kind: 'retry' }`。本插件用**内存中**的 per-step 计数（按 agent 对象身份 + turn + step + provider 作 key），**不注册 session projection**，因此绝不与内置重试插件的 `llmRetry` projection 冲突。它尊重本轮 abort signal，卸载时干净中止（abort 活跃等待并 drain），绝不阻塞本轮收尾或插件卸载。
 
-重试不会作为单独的 `llm/retry` session 事件记录（那份持久化归内置重试插件所有）；本插件只调度等待并返回 `{ kind: 'retry' }`。每次重试仍是真实的、计费的 provider 请求。
+重试会发射 `llm/retry` 和 `llm/retry-started` session 事件，每次重试在 UI 中可见（与内置重试插件格式一致）。
+
+## SSH 远程开发
+
+本插件还提供 **SSH 工具**，让 agent 可以直接在远程服务器上执行命令、读写文件，无需手动 SSH。
+
+### 工具
+
+| 工具 | 说明 | 参数 |
+|---|---|---|
+| `ssh-exec` | 在远程服务器上执行 shell 命令 | `command`（必填）、`timeoutMs`（可选，默认 30000） |
+| `ssh-read` | 读取远程服务器上的文件 | `path`（必填） |
+| `ssh-write` | 向远程服务器写入文件 | `path`（必填）、`content`（必填） |
+
+### 使用示例
+
+```
+Agent: ssh-exec { command: "ls -la /home/user/project" }
+→ { stdout: "total 48\ndrwxr-xr-x ...", stderr: "", exitCode: 0 }
+
+Agent: ssh-read { path: "/home/user/project/config.yaml" }
+→ { content: "host: ...\nport: 22", path: "/home/user/project/config.yaml" }
+
+Agent: ssh-write { path: "/home/user/project/README.md", content: "# My Project" }
+→ { success: true, path: "/home/user/project/README.md" }
+```
+
+SSH 连接在首次调用时懒加载并缓存，连接参数在插件配置中设置（见下方）。
 
 ## 安装
 
@@ -84,6 +111,15 @@ plugin_manager → install_bundle → target: /绝对路径/dsh-retry-llm-plugin
       maxDelayMs: 30000          # 上限（默认 30000；内置用 10000）
       jitterRatio: 0.2           # 对称抖动范围（默认 0.2）
     respectProviderRetryAfter: true   # 在 maxDelayMs 内尊重 provider 的 Retry-After
+
+    # ── SSH 远程开发 ──
+    ssh:
+      host: myserver.com         # SSH 主机名（默认 localhost）
+      port: 22                   # SSH 端口（默认 22）
+      username: myuser           # SSH 用户名
+      identityFile: ~/.ssh/id_rsa  # SSH 私钥路径
+      password: ''               # 密码认证（密钥的替代方案）
+      remoteDir: /home/myuser    # 默认远程工作目录
 ```
 
 ### 默认值一览
@@ -98,6 +134,12 @@ plugin_manager → install_bundle → target: /绝对路径/dsh-retry-llm-plugin
 | `backoff.maxDelayMs` | `30000` | 比内置的 10s 更宽，适配恢复慢的远程端点 |
 | `backoff.jitterRatio` | `0.2` | |
 | `respectProviderRetryAfter` | `true` | |
+| `ssh.host` | `localhost` | SSH 主机名 |
+| `ssh.port` | `22` | SSH 端口 |
+| `ssh.username` | `''` | SSH 用户名 |
+| `ssh.identityFile` | `''` | SSH 私钥路径 |
+| `ssh.password` | `''` | SSH 密码（密钥的替代方案） |
+| `ssh.remoteDir` | `''` | 默认远程工作目录 |
 
 退避为带对称抖动的有界指数退避，公式与内置策略一致。
 
@@ -157,7 +199,7 @@ pnpm typecheck   # tsc --noEmit
 
 ## 兼容性
 
-基于 DeepSeek Harness `0.1.7-rc.1`（Cordis `4.0.4`、schemastery `3.18.4`）编写测试。运行时唯一 import 是 `@deepseek-ai/schemastery`，由宿主模块图解析；`devDependencies` 里的 `@deepseek-ai/*` 仅用于类型检查与构建。
+基于 DeepSeek Harness `0.1.7-rc.1`（Cordis `4.0.4`、schemastery `3.18.4`）编写测试。运行时依赖：`ssh2`（SSH 客户端）、`@deepseek-ai/schemastery`（配置 schema）、`@deepseek-ai/dsh-tools`（工具定义）。`devDependencies` 里的 `@deepseek-ai/*` 仅用于类型检查与构建。
 
 ## 许可
 

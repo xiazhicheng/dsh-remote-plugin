@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that **boosts model-request retries** for unstable or rate-limited LLM endpoints.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that provides **SSH remote development tools** (exec, read, write) and **boosts LLM retries** to 50+ for unstable endpoints.
 
 When your LLM is flaky — frequent `429`/`RATE_LIMIT`, `5xx`/`SERVER`, timeouts, empty responses — the built-in recovery ends the turn after just **5 retries**. This plugin installs an additional listener on the agent loop's `agent/request-error` recovery waterfall that retries **50 times** by default, or **forever** in `always` mode, stopping only on success, turn cancellation, or plugin disposal.
 
@@ -31,7 +31,34 @@ This plugin adds a **second listener** on the same waterfall with its own, more 
 
 Both plugins cooperate by waterfall order: whichever owns a given retry returns `{ kind: 'retry' }`. This plugin keeps its own per-step retry count **in memory** (keyed by agent object identity + turn + step + provider) and registers **no session projection**, so it never conflicts with the built-in retry plugin's `llmRetry` projection. It respects the turn abort signal and disposes cleanly (aborts active waits, drains them), so it never blocks turn quiescence or plugin disposal.
 
-Retries are not logged as separate `llm/retry` session events (that durability is owned by the built-in retry plugin); this plugin only schedules the wait and returns `{ kind: 'retry' }`. Each retry is still a real, billed provider request.
+Retries emit `llm/retry` and `llm/retry-started` session events so every retry is visible in the UI (matching the built-in retry plugin's format).
+
+## SSH Remote Development
+
+This plugin also provides **SSH tools** that let the agent execute commands, read files, and write files on a remote server — enabling remote development without SSH-ing manually.
+
+### Tools
+
+| Tool | Description | Parameters |
+|---|---|---|
+| `ssh-exec` | Execute a shell command on the remote server | `command` (required), `timeoutMs` (optional, default 30000) |
+| `ssh-read` | Read a file from the remote server | `path` (required) |
+| `ssh-write` | Write content to a file on the remote server | `path` (required), `content` (required) |
+
+### Example usage
+
+```
+Agent: ssh-exec { command: "ls -la /home/user/project" }
+→ { stdout: "total 48\ndrwxr-xr-x ...", stderr: "", exitCode: 0 }
+
+Agent: ssh-read { path: "/home/user/project/config.yaml" }
+→ { content: "host: ...\nport: 22", path: "/home/user/project/config.yaml" }
+
+Agent: ssh-write { path: "/home/user/project/README.md", content: "# My Project" }
+→ { success: true, path: "/home/user/project/README.md" }
+```
+
+The SSH connection is established lazily on first tool call and cached for the plugin's lifetime. Connection parameters are configured in the plugin config (see below).
 
 ## Install
 
@@ -86,6 +113,15 @@ The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). 
       maxDelayMs: 30000          # cap (default 30000; built-in uses 10000)
       jitterRatio: 0.2           # symmetric jitter range (default 0.2)
     respectProviderRetryAfter: true   # honor a valid provider Retry-After within maxDelayMs
+
+    # ── SSH remote development ──
+    ssh:
+      host: myserver.com         # SSH hostname (default localhost)
+      port: 22                   # SSH port (default 22)
+      username: myuser           # SSH username
+      identityFile: ~/.ssh/id_rsa  # SSH private key path
+      password: ''               # password auth (alternative to key)
+      remoteDir: /home/myuser    # default remote working directory
 ```
 
 ### Defaults at a glance
@@ -100,6 +136,12 @@ The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). 
 | `backoff.maxDelayMs` | `30000` | Wider than the built-in 10s, for slow-recovering remote endpoints |
 | `backoff.jitterRatio` | `0.2` | |
 | `respectProviderRetryAfter` | `true` | |
+| `ssh.host` | `localhost` | SSH hostname |
+| `ssh.port` | `22` | SSH port |
+| `ssh.username` | `''` | SSH username |
+| `ssh.identityFile` | `''` | SSH private key path |
+| `ssh.password` | `''` | SSH password (alternative to key) |
+| `ssh.remoteDir` | `''` | Default remote working directory |
 
 Backoff is bounded exponential with symmetric jitter, matching the built-in policy's formula.
 
@@ -159,7 +201,7 @@ pnpm typecheck   # tsc --noEmit
 
 ## Compatibility
 
-Built and tested against DeepSeek Harness `0.1.7-rc.1` (Cordis `4.0.4`, schemastery `3.18.4`). The only runtime import is `@deepseek-ai/schemastery`, resolved from the host's module graph; the `@deepseek-ai/*` entries in `devDependencies` are for type-checking and building only.
+Built and tested against DeepSeek Harness `0.1.7-rc.1` (Cordis `4.0.4`, schemastery `3.18.4`). Runtime dependencies: `ssh2` (SSH client), `@deepseek-ai/schemastery` (config schema), `@deepseek-ai/dsh-tools` (tool definitions). The `@deepseek-ai/*` entries in `devDependencies` are for type-checking and building only.
 
 ## License
 

@@ -12,3 +12,10 @@
           maxDelayMs: 30000
           jitterRatio: 0.2
         respectProviderRetryAfter: true
+        ssh:
+          host: localhost
+          port: 22
+          username: ''
+          identityFile: ''
+          password: ''
+          remoteDir: ''

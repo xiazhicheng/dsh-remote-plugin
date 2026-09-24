@@ -1,7 +1,7 @@
 {
   "name": "dsh-retry-llm-plugin",
   "version": "0.1.0",
-  "description": "DSH plugin that boosts model-request retries to 50 (or unlimited always-mode) on the agent/request-error waterfall — for unstable or rate-limited remote LLM endpoints.",
+  "description": "DSH plugin for SSH remote development (exec/read/write tools) with boosted LLM retries — for unstable or rate-limited remote LLM endpoints.",
   "private": false,
   "type": "module",
   "main": "./lib/index.js",
@@ -33,16 +33,23 @@
     "dsh",
     "deepseek-harness",
     "plugin",
+    "ssh",
+    "remote",
+    "development",
     "llm",
     "retry",
     "rate-limit",
     "resilience"
   ],
   "license": "Apache-2.0",
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/dsh-agent": "0.1.7-rc.1",
     "@deepseek-ai/dsh-llm": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1",
     "@deepseek-ai/schemastery": "~3.18.4",
     "tsdown": "^0.9.0",
     "typescript": "^5.6.0"
