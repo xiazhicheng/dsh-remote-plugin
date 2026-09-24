@@ -6,7 +6,7 @@ import { Client } from 'ssh2';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 export const name = 'retry-llm-plugin';
-export const inject = ['agents', 'sessionProjections', 'tools'];
+export const inject = ['agents', 'sessionProjections'];
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
@@ -306,54 +306,81 @@ export function apply(
     return tracked;
   });
 
-  // ── SSH tool registration ────────────────────────────────────────────────
+  // ── SSH tool registration (per-agent) ────────────────────────────────────
 
-  const toolDisposers = [
-    ctx.tools.register(defineTool({
-      name: 'ssh-exec',
-      description: 'Execute a shell command on the remote SSH server and return stdout, stderr, and exit code.',
-      parameters: {
-        command: { type: 'string' as const, required: true, description: 'Shell command to execute on the remote server.' },
-        timeoutMs: { type: 'number' as const, description: 'Timeout in milliseconds. Defaults to 30000.' },
-      },
-      output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
-      execute(args: { command: string; timeoutMs?: number }) {
-        return getSshClient().then(c => sshExec(c, args.command, args.timeoutMs ?? 30000));
-      },
-    })),
+  const agentToolDisposers = new Map<object, Array<() => void>>();
 
-    ctx.tools.register(defineTool({
-      name: 'ssh-read',
-      description: 'Read a file from the remote SSH server.',
-      parameters: {
-        path: { type: 'string' as const, required: true, description: 'Remote file path to read.' },
-      },
-      output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
-      execute(args: { path: string }) {
-        return getSshClient().then(c => sshRead(c, args.path));
-      },
-    })),
+  function registerSshTools(agent: { ctx: { tools: { register: (tool: unknown) => () => void } } }): void {
+    const disposers: Array<() => void> = [];
+    try {
+      disposers.push(agent.ctx.tools.register(defineTool({
+        name: 'ssh-exec',
+        description: 'Execute a shell command on the remote SSH server and return stdout, stderr, and exit code.',
+        parameters: {
+          command: { type: 'string' as const, required: true, description: 'Shell command to execute on the remote server.' },
+          timeoutMs: { type: 'number' as const, description: 'Timeout in milliseconds. Defaults to 30000.' },
+        },
+        output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
+        execute(args: { command: string; timeoutMs?: number }) {
+          return getSshClient().then(c => sshExec(c, args.command, args.timeoutMs ?? 30000));
+        },
+      })));
 
-    ctx.tools.register(defineTool({
-      name: 'ssh-write',
-      description: 'Write content to a file on the remote SSH server.',
-      parameters: {
-        path: { type: 'string' as const, required: true, description: 'Remote file path to write.' },
-        content: { type: 'string' as const, required: true, description: 'Content to write to the file.' },
-      },
-      output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
-      execute(args: { path: string; content: string }) {
-        return getSshClient().then(c => sshWrite(c, args.path, args.content));
-      },
-    })),
-  ];
+      disposers.push(agent.ctx.tools.register(defineTool({
+        name: 'ssh-read',
+        description: 'Read a file from the remote SSH server.',
+        parameters: {
+          path: { type: 'string' as const, required: true, description: 'Remote file path to read.' },
+        },
+        output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
+        execute(args: { path: string }) {
+          return getSshClient().then(c => sshRead(c, args.path));
+        },
+      })));
+
+      disposers.push(agent.ctx.tools.register(defineTool({
+        name: 'ssh-write',
+        description: 'Write content to a file on the remote SSH server.',
+        parameters: {
+          path: { type: 'string' as const, required: true, description: 'Remote file path to write.' },
+          content: { type: 'string' as const, required: true, description: 'Content to write to the file.' },
+        },
+        output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
+        execute(args: { path: string; content: string }) {
+          return getSshClient().then(c => sshWrite(c, args.path, args.content));
+        },
+      })));
+    } catch (e) {
+      ctx.logger.warn('retry-llm-plugin: failed to register SSH tools for agent: %s', e instanceof Error ? e.message : String(e));
+      for (const d of disposers) d();
+      return;
+    }
+    agentToolDisposers.set(agent, disposers);
+  }
+
+  const disposeAgentListener = ctx.on('agent/created', ({ agent }: { agent: { ctx: { tools: { register: (tool: unknown) => () => void } } } }) => {
+    registerSshTools(agent);
+  });
+
+  const disposeAgentDisposeListener = ctx.on('agent/disposed', ({ agent }: { agent: object }) => {
+    const disposers = agentToolDisposers.get(agent);
+    if (disposers) {
+      for (const d of disposers) d();
+      agentToolDisposers.delete(agent);
+    }
+  });
 
   // ── Disposal ─────────────────────────────────────────────────────────────
 
   ctx.effect(
     () => async () => {
       disposeListener();
-      for (const d of toolDisposers) d();
+      disposeAgentListener();
+      disposeAgentDisposeListener();
+      for (const disposers of agentToolDisposers.values()) {
+        for (const d of disposers) d();
+      }
+      agentToolDisposers.clear();
       lifetime.abort(new Error('retry-llm-plugin disposed'));
       if (sshConn) {
         const client = await sshConn.catch(() => null);
