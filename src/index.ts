@@ -2,11 +2,9 @@
 import z from '@deepseek-ai/schemastery';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Client } from 'ssh2';
-import { defineTool } from '@deepseek-ai/dsh-tools';
 
 export const name = 'retry-llm-plugin';
-export const inject = ['agents', 'sessionProjections'];
+export const inject = ['agents'];
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
@@ -138,27 +136,66 @@ interface RequestErrorPayload {
   [key: string]: unknown;
 }
 
-// ── SSH helpers ──────────────────────────────────────────────────────────────
+// ── Lazy native/heavy imports ────────────────────────────────────────────────
+// ssh2 (native binding) and @deepseek-ai/dsh-tools are loaded on demand so a
+// resolution or load failure never blocks plugin activation or DSH startup:
+// the retry feature keeps working, SSH tools just report unavailable.
 
-function sshExec(client: Client, command: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+let ssh2ClientCtor: (new (...args: unknown[]) => { on: (...a: unknown[]) => unknown }) | null = null;
+let ssh2Failed = false;
+
+async function loadSsh2Client(): Promise<{ on: (...a: unknown[]) => unknown } | null> {
+  if (ssh2ClientCtor) return new ssh2ClientCtor();
+  if (ssh2Failed) return null;
+  try {
+    const mod = await import('ssh2');
+    ssh2ClientCtor = mod.Client;
+    return new ssh2ClientCtor();
+  } catch {
+    ssh2Failed = true;
+    return null;
+  }
+}
+
+type DefineToolFn = (options: Record<string, unknown>) => { name: string; description: string; parameters: unknown; output: unknown; execute(args: unknown, exec: unknown): Promise<unknown> };
+let defineToolFn: DefineToolFn | null = null;
+let toolsFailed = false;
+
+async function loadDefineTool(): Promise<DefineToolFn | null> {
+  if (defineToolFn) return defineToolFn;
+  if (toolsFailed) return null;
+  try {
+    const mod = await import('@deepseek-ai/dsh-tools');
+    defineToolFn = mod.defineTool as DefineToolFn;
+    return defineToolFn;
+  } catch {
+    toolsFailed = true;
+    return null;
+  }
+}
+
+// ── SSH helpers (receive an already-connected client) ───────────────────────
+
+function sshExec(client: { exec: (cmd: string, cb: (err: Error | undefined, stream: { on: (e: string, cb: (d: { toString(): string }) => void) => void; stderr: { on: (e: string, cb: (d: { toString(): string }) => void) => void } }) => void) => void; end: () => void }, command: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { client.end(); reject(new Error('ssh-exec timeout')); }, timeoutMs);
     client.exec(command, (err, stream) => {
       if (err) { clearTimeout(timer); return reject(err); }
       let stdout = '', stderr = '';
-      stream.on('data', (d: Buffer) => { stdout += d.toString(); });
-      stream.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-      stream.on('close', (code: number) => { clearTimeout(timer); resolve({ stdout, stderr, exitCode: code }); });
-      stream.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+      stream.on('data', (d) => { stdout += d.toString(); });
+      stream.stderr.on('data', (d) => { stderr += d.toString(); });
+      // ssh2 streams close with an exit-code 'close' event carrying the code
+      (stream as unknown as { on: (e: string, cb: (code: number) => void) => void }).on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, exitCode: code }); });
+      (stream as unknown as { on: (e: string, cb: (e: Error) => void) => void }).on('error', (e) => { clearTimeout(timer); reject(e); });
     });
   });
 }
 
-function sshRead(client: Client, remotePath: string): Promise<{ content: string; path: string }> {
+function sshRead(client: { sftp: (cb: (err: Error | undefined, sftp: { readFile: (p: string, enc: string, cb: (err: Error | undefined, content: Buffer | string) => void) => void }) => void) => void }, remotePath: string): Promise<{ content: string; path: string }> {
   return new Promise((resolve, reject) => {
     client.sftp((err, sftp) => {
       if (err) return reject(err);
-      sftp.readFile(remotePath, 'utf8', (err: Error | undefined, content: Buffer | string) => {
+      sftp.readFile(remotePath, 'utf8', (err, content) => {
         if (err) return reject(err);
         resolve({ content: typeof content === 'string' ? content : content.toString('utf8'), path: remotePath });
       });
@@ -166,11 +203,11 @@ function sshRead(client: Client, remotePath: string): Promise<{ content: string;
   });
 }
 
-function sshWrite(client: Client, remotePath: string, content: string): Promise<{ success: boolean; path: string }> {
+function sshWrite(client: { sftp: (cb: (err: Error | undefined, sftp: { writeFile: (p: string, content: string, cb: (err: Error | undefined) => void) => void }) => void) => void }, remotePath: string, content: string): Promise<{ success: boolean; path: string }> {
   return new Promise((resolve, reject) => {
     client.sftp((err, sftp) => {
       if (err) return reject(err);
-      sftp.writeFile(remotePath, content, (err: Error | undefined) => {
+      sftp.writeFile(remotePath, content, (err) => {
         if (err) return reject(err);
         resolve({ success: true, path: remotePath });
       });
@@ -192,9 +229,8 @@ function jsonOutput(schema: Record<string, unknown>) {
 export function apply(
   ctx: {
     logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
-    on: (event: string, fn: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>) => () => void;
-    effect: (fn: () => Promise<() => Promise<void>>, label: string) => void;
-    tools: { register: (tool: unknown) => () => void };
+    on: (event: string, fn: (payload: never, next: (() => Promise<unknown>) | undefined) => unknown) => () => void;
+    effect: (fn: () => () => void | Promise<void>) => void;
   },
   config: ConfigSchema = {},
 ): void {
@@ -210,22 +246,14 @@ export function apply(
   const states = new WeakMap<object, { turn: number; step: number; counts: Map<string, number> }>();
 
   // SSH connection (lazy, cached)
-  let sshConn: Promise<Client> | null = null;
-  function getSshClient(): Promise<Client> {
+  let sshConn: Promise<unknown> | null = null;
+  function getSshClient(): Promise<unknown> {
     if (!sshConn) {
-      sshConn = new Promise((resolve, reject) => {
-        const client = new Client();
-        client.on('ready', () => resolve(client));
-        client.on('error', reject);
-        client.connect({
-          host: resolved.ssh.host,
-          port: resolved.ssh.port,
-          username: resolved.ssh.username,
-          privateKey: resolved.ssh.identityFile ? readFileSync(resolved.ssh.identityFile) : undefined,
-          password: resolved.ssh.password || undefined,
-          readyTimeout: 10000,
-        });
-      });
+      sshConn = (async () => {
+        const client = await loadSsh2Client();
+        if (!client) throw new Error('ssh2 is not available');
+        return client;
+      })();
     }
     return sshConn;
   }
@@ -306,49 +334,53 @@ export function apply(
     return tracked;
   });
 
-  // ── SSH tool registration (per-agent) ────────────────────────────────────
+  // ── SSH tool registration (per-agent, lazy) ──────────────────────────────
 
   const agentToolDisposers = new Map<object, Array<() => void>>();
 
-  function registerSshTools(agent: { ctx: { tools: { register: (tool: unknown) => () => void } } }): void {
+  async function registerSshTools(agent: {
+    ctx: { tools: { register: (tool: unknown) => () => void } };
+  }): Promise<void> {
+    const defineTool = await loadDefineTool();
+    if (!defineTool) {
+      ctx.logger.warn('retry-llm-plugin: @deepseek-ai/dsh-tools unavailable, SSH tools disabled');
+      return;
+    }
     const disposers: Array<() => void> = [];
     try {
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-exec',
         description: 'Execute a shell command on the remote SSH server and return stdout, stderr, and exit code.',
         parameters: {
-          command: { type: 'string' as const, required: true, description: 'Shell command to execute on the remote server.' },
-          timeoutMs: { type: 'number' as const, description: 'Timeout in milliseconds. Defaults to 30000.' },
+          command: { type: 'string', required: true, description: 'Shell command to execute on the remote server.' },
+          timeoutMs: { type: 'number', description: 'Timeout in milliseconds. Defaults to 30000.' },
         },
         output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
-        execute(args: { command: string; timeoutMs?: number }) {
-          return getSshClient().then(c => sshExec(c, args.command, args.timeoutMs ?? 30000));
-        },
+        execute: (args: { command: string; timeoutMs?: number }) =>
+          getSshClient().then((c) => sshExec(c as never, args.command, args.timeoutMs ?? 30000)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-read',
         description: 'Read a file from the remote SSH server.',
         parameters: {
-          path: { type: 'string' as const, required: true, description: 'Remote file path to read.' },
+          path: { type: 'string', required: true, description: 'Remote file path to read.' },
         },
         output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
-        execute(args: { path: string }) {
-          return getSshClient().then(c => sshRead(c, args.path));
-        },
+        execute: (args: { path: string }) =>
+          getSshClient().then((c) => sshRead(c as never, args.path)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-write',
         description: 'Write content to a file on the remote SSH server.',
         parameters: {
-          path: { type: 'string' as const, required: true, description: 'Remote file path to write.' },
-          content: { type: 'string' as const, required: true, description: 'Content to write to the file.' },
+          path: { type: 'string', required: true, description: 'Remote file path to write.' },
+          content: { type: 'string', required: true, description: 'Content to write to the file.' },
         },
         output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
-        execute(args: { path: string; content: string }) {
-          return getSshClient().then(c => sshWrite(c, args.path, args.content));
-        },
+        execute: (args: { path: string; content: string }) =>
+          getSshClient().then((c) => sshWrite(c as never, args.path, args.content)),
       })));
     } catch (e) {
       ctx.logger.warn('retry-llm-plugin: failed to register SSH tools for agent: %s', e instanceof Error ? e.message : String(e));
@@ -358,11 +390,14 @@ export function apply(
     agentToolDisposers.set(agent, disposers);
   }
 
-  const disposeAgentListener = ctx.on('agent/created', ({ agent }: { agent: { ctx: { tools: { register: (tool: unknown) => () => void } } } }) => {
-    registerSshTools(agent);
+  const disposeAgentListener = ctx.on('agent/created', (payload: never) => {
+    const agent = (payload as { agent?: { ctx: { tools: { register: (tool: unknown) => () => void } } } }).agent;
+    if (agent) void registerSshTools(agent);
   });
 
-  const disposeAgentDisposeListener = ctx.on('agent/disposed', ({ agent }: { agent: object }) => {
+  const disposeAgentDisposeListener = ctx.on('agent/disposed', (payload: never) => {
+    const agent = (payload as { agent?: object }).agent;
+    if (!agent) return;
     const disposers = agentToolDisposers.get(agent);
     if (disposers) {
       for (const d of disposers) d();
@@ -372,22 +407,21 @@ export function apply(
 
   // ── Disposal ─────────────────────────────────────────────────────────────
 
-  ctx.effect(
-    () => async () => {
-      disposeListener();
-      disposeAgentListener();
-      disposeAgentDisposeListener();
-      for (const disposers of agentToolDisposers.values()) {
-        for (const d of disposers) d();
+  ctx.effect(() => async () => {
+    disposeListener();
+    disposeAgentListener();
+    disposeAgentDisposeListener();
+    for (const disposers of agentToolDisposers.values()) {
+      for (const d of disposers) d();
+    }
+    agentToolDisposers.clear();
+    lifetime.abort(new Error('retry-llm-plugin disposed'));
+    if (sshConn) {
+      const client = await sshConn.catch(() => null);
+      if (client && typeof (client as { end?: () => void }).end === 'function') {
+        (client as { end: () => void }).end();
       }
-      agentToolDisposers.clear();
-      lifetime.abort(new Error('retry-llm-plugin disposed'));
-      if (sshConn) {
-        const client = await sshConn.catch(() => null);
-        if (client) client.end();
-      }
-      await Promise.allSettled([...active]);
-    },
-    'retry-llm-plugin: abort and drain active recovery',
-  );
+    }
+    await Promise.allSettled([...active]);
+  });
 }
