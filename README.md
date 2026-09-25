@@ -103,7 +103,11 @@ The password field has its own **显示/隐藏 (show/hide)** toggle, so you can 
 
 Every target with a saved password has a **显示密码 (reveal)** button: the plaintext is fetched from the host only when you click, can be copied, and can be hidden again — the list response itself never carries it.
 
-Resolution order: tool `target` argument → the default target → the plugin config `ssh.*`. Targets live in `remote-ssh-targets.json` in the profile directory (0600); the file holds no password — a saved password lives in DSH's credential store under the target's reference.
+Resolution order: tool `target` argument → **the target bound to the session's workspace** → the default target → the plugin config `ssh.*`.
+
+**Per-workspace binding**: opening a target gives it its own session directory `~/dsh-remote/<target id>` (created and bound by the host; point it at your own directory if you prefer). Each `远程 · <name>` workspace is therefore bound to its own host — even after the default target changes, a session opened in the 财经 workspace keeps talking to 财经. Deleting a target releases its bindings but leaves the directory on disk.
+
+Targets and bindings live in `remote-ssh-targets.json` in the profile directory (0600); the file holds no password — a saved password lives in DSH's credential store under the target's reference.
 
 ### Local directory vs remote directory
 

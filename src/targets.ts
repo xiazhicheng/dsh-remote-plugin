@@ -26,9 +26,11 @@ export interface TargetStoreFile {
   version: 1;
   defaultId: string;
   targets: SshTarget[];
+  /** Session workspace directory -> target id, so a session resolves its own host. */
+  bindings: Record<string, string>;
 }
 
-const EMPTY: TargetStoreFile = { version: 1, defaultId: '', targets: [] };
+const EMPTY: TargetStoreFile = { version: 1, defaultId: '', targets: [], bindings: {} };
 
 /** Where this profile keeps its target list. */
 export function storePath(): string {
@@ -42,7 +44,14 @@ export function loadStore(): TargetStoreFile {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<TargetStoreFile>;
     const targets = Array.isArray(parsed.targets) ? parsed.targets.filter(isTargetish).map(normalizeStored) : [];
-    return { version: 1, defaultId: typeof parsed.defaultId === 'string' ? parsed.defaultId : '', targets };
+    const raw = (parsed as { bindings?: unknown }).bindings;
+    const bindings: Record<string, string> = {};
+    if (typeof raw === 'object' && raw !== null) {
+      for (const [dir, id] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof id === 'string' && targets.some((t) => t.id === id)) bindings[dir] = id;
+      }
+    }
+    return { version: 1, defaultId: typeof parsed.defaultId === 'string' ? parsed.defaultId : '', targets, bindings };
   } catch {
     return { ...EMPTY, targets: [] };
   }
@@ -134,6 +143,9 @@ export function upsertTarget(store: TargetStoreFile, input: TargetInput): SshTar
 export function removeTarget(store: TargetStoreFile, id: string): boolean {
   const before = store.targets.length;
   store.targets = store.targets.filter((t) => t.id !== id);
+  for (const [dir, bound] of Object.entries(store.bindings)) {
+    if (bound === id) delete store.bindings[dir];
+  }
   if (store.defaultId === id) store.defaultId = store.targets[0]?.id ?? '';
   return store.targets.length !== before;
 }
@@ -142,6 +154,23 @@ export function removeTarget(store: TargetStoreFile, id: string): boolean {
 export function findTarget(store: TargetStoreFile, ref: string): SshTarget | undefined {
   const key = ref.trim().toLowerCase();
   return store.targets.find((t) => t.id === ref) ?? store.targets.find((t) => t.name.toLowerCase() === key);
+}
+
+/** The target bound to one session workspace directory, when one is recorded. */
+export function boundTarget(store: TargetStoreFile, dir: string | undefined): SshTarget | undefined {
+  if (!dir) return undefined;
+  const id = store.bindings[dir];
+  return id === undefined ? undefined : store.targets.find((t) => t.id === id);
+}
+
+/** Record (or clear) the target a workspace directory opens. */
+export function bindTarget(store: TargetStoreFile, dir: string, id: string): void {
+  store.bindings[dir] = id;
+}
+
+/** Every workspace directory currently bound to one target. */
+export function boundDirs(store: TargetStoreFile, id: string): string[] {
+  return Object.entries(store.bindings).filter(([, bound]) => bound === id).map(([dir]) => dir);
 }
 
 /** Project a stored target onto the connection settings the SSH layer needs. */

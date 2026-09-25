@@ -57,6 +57,12 @@ window.__ModuleLoader__.load({
 			return result;
 		}
 
+		/** Create and bind the session workspace for one target (host-side, per target). */
+		async function prepareTargetDir(targetId) {
+			const data = await api("/prepare-dir", { method: "POST", body: JSON.stringify({ target: targetId }) });
+			return data.dir || "";
+		}
+
 		async function ensureRemoteWorkspace(sessionDir, name, host) {
 			const workspaceRemote = service("remote.workspace");
 			if (!workspaceRemote || typeof workspaceRemote.create !== "function") {
@@ -459,7 +465,6 @@ window.__ModuleLoader__.load({
 		function RemoteWorkspaceFlow(props) {
 			const { open, busy, onPicked, onCancel, onError } = props;
 			const [mode, setMode] = useState("choose");
-			const [homeDir, setHomeDir] = useState("");
 			const [targets, setTargets] = useState([]);
 			const [defaultId, setDefaultId] = useState("");
 			const [revealed, setRevealed] = useState({});
@@ -477,7 +482,6 @@ window.__ModuleLoader__.load({
 					const data = await api("/targets");
 					setTargets(data.targets || []);
 					setDefaultId(data.defaultId || "");
-					setHomeDir(data.homeDir || "");
 					setListError("");
 					return data;
 				} catch (e) {
@@ -521,21 +525,16 @@ window.__ModuleLoader__.load({
 					.then((path) => resolveOutcome(path), (reason) => fail(errorText(reason)));
 			};
 
-			/** A session needs a local cwd; the plugin uses the operator's home dir. */
-			const sessionDir = async () => {
-				if (homeDir) return homeDir;
-				const data = await loadTargets();
-				return (data && data.homeDir) || "";
-			};
-
 			/** Enter a SAVED remote workspace: make it the default, title its workspace, adopt it. */
 			const openTarget = async (target) => {
 				setListError("");
 				try {
 					await api("/default", { method: "POST", body: JSON.stringify({ target: target.id }) });
 					setDefaultId(target.id);
-					const dir = await sessionDir();
-					if (!dir) throw new Error("拿不到本地主目录，无法建立会话");
+					// One session workspace per target, so a session resolves its own
+					// host through the binding instead of the global default.
+					const dir = target.localDir || await prepareTargetDir(target.id);
+					if (!dir) throw new Error("无法确定会话工作目录");
 					try {
 						await ensureRemoteWorkspace(dir, target.name, target.host);
 					} catch { /* the owner still adopts it, named from the path */ }
@@ -575,9 +574,15 @@ window.__ModuleLoader__.load({
 				// actually talks to this host, and it opens right here.
 				const result = await editor.save({ setDefault: true });
 				if (!result) return;
-				const dir = await sessionDir();
+				let dir = "";
+				try {
+					dir = result.savedTargetId ? await prepareTargetDir(result.savedTargetId) : "";
+				} catch (e) {
+					fail(`无法准备会话目录：${errorText(e)}`);
+					return;
+				}
 				if (!dir) {
-					fail("拿不到本地主目录，无法建立会话工作区");
+					fail("无法确定会话工作目录");
 					return;
 				}
 				try {
@@ -624,6 +629,7 @@ window.__ModuleLoader__.load({
 								h("button", { type: "button", className: "dshSsh_btn", onClick: () => void removeTarget(target) }, "删除")),
 							h("div", { className: "dshSsh_facts" },
 								fact("远程目录", target.remoteDir || "（未设置）"),
+								fact("会话目录", target.localDir || "（打开时自动创建并绑定）"),
 								fact("密码", target.passwordEnv
 									? ((target.hasStoredPassword || target.hasPasswordEnv) ? `已保存 · 引用 ${target.passwordEnv}` : `未保存 · 引用 ${target.passwordEnv}`)
 									: "未保存（用私钥 / ssh-agent）")),
@@ -640,7 +646,8 @@ window.__ModuleLoader__.load({
 				TargetForm({ editor }),
 				h("div", { className: "dshSsh_hint" },
 					"「远程目录」是**远程机器上的**工作目录，命令都在那里执行（可直接输入路径，或点「浏览远端…」选择）。"
-					+ "保存后会立即设为默认，并在侧边栏生成/打开一个名为「远程 · 名称 (主机)」的工作区；会话的本地目录由插件自动使用你的主目录。"),
+					+ "保存后会立即设为默认，自动创建并绑定一个专属会话目录（`~/dsh-remote/目标id`），"
+					+ "并在侧边栏生成/打开一个名为「远程 · 名称 (主机)」的工作区——之后该会话里的 ssh 工具就认这台机器。"),
 				Messages({ error: editor.error, okText: editor.okText }),
 				h("div", { className: "dshSsh_actions" },
 					h("button", { type: "button", className: "dshSsh_btn", disabled: editor.busy, onClick: () => void editor.test() },
