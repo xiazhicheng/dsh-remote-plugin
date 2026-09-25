@@ -1,7 +1,32 @@
-// Source of truth. Build to lib/index.js with `pnpm build`.
+// Source of truth. Build to lib/ with `pnpm build` (tsdown) or `pnpm build:tsc`.
 import z from '@deepseek-ai/schemastery';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
+import {
+  connectSsh,
+  loadSsh2ClientCtor,
+  sshExec,
+  sshListDir,
+  sshRead,
+  sshWrite,
+  testConnection,
+  type SshClientLike,
+  type SshConfig,
+} from './ssh.js';
+import {
+  describeTarget,
+  findTarget,
+  loadStore,
+  removeTarget,
+  saveStore,
+  slug,
+  type SshTarget,
+  toSshConfig,
+  upsertTarget,
+  type TargetInput,
+  type TargetStoreFile,
+} from './targets.js';
 
 export const name = 'retry-llm-plugin';
 export const inject = ['agents'];
@@ -23,13 +48,19 @@ interface BackoffConfig {
   jitterRatio?: number;
 }
 
-interface SshConfig {
+interface SshConfigSchema {
   host: string;
   port: number;
   username: string;
   identityFile: string;
   password: string;
+  passwordEnv: string;
   remoteDir: string;
+}
+
+/** The agent-scoped surface the SSH tools attach to. */
+interface AgentScope {
+  ctx: { tools: { register: (tool: unknown) => () => void } };
 }
 
 export interface ConfigSchema {
@@ -39,7 +70,7 @@ export interface ConfigSchema {
   excludeCodes?: string[];
   backoff?: BackoffConfig;
   respectProviderRetryAfter?: boolean;
-  ssh?: Partial<SshConfig>;
+  ssh?: Partial<SshConfigSchema>;
 }
 
 export const Config = z.object({
@@ -59,6 +90,7 @@ export const Config = z.object({
     username: z.string().default(''),
     identityFile: z.string().default(''),
     password: z.string().default(''),
+    passwordEnv: z.string().default(''),
     remoteDir: z.string().default(''),
   }).default({}),
 });
@@ -93,6 +125,7 @@ function resolveConfig(config?: ConfigSchema): ResolvedConfig {
       username: s.username ?? '',
       identityFile: s.identityFile ?? '',
       password: s.password ?? '',
+      passwordEnv: s.passwordEnv ?? '',
       remoteDir: s.remoteDir ?? '',
     },
   };
@@ -141,22 +174,6 @@ interface RequestErrorPayload {
 // resolution or load failure never blocks plugin activation or DSH startup:
 // the retry feature keeps working, SSH tools just report unavailable.
 
-let ssh2ClientCtor: (new (...args: unknown[]) => { on: (...a: unknown[]) => unknown }) | null = null;
-let ssh2Failed = false;
-
-async function loadSsh2Client(): Promise<{ on: (...a: unknown[]) => unknown } | null> {
-  if (ssh2ClientCtor) return new ssh2ClientCtor();
-  if (ssh2Failed) return null;
-  try {
-    const mod = await import('ssh2');
-    ssh2ClientCtor = mod.Client;
-    return new ssh2ClientCtor();
-  } catch {
-    ssh2Failed = true;
-    return null;
-  }
-}
-
 type DefineToolFn = (options: Record<string, unknown>) => { name: string; description: string; parameters: unknown; output: unknown; execute(args: unknown, exec: unknown): Promise<unknown> };
 let defineToolFn: DefineToolFn | null = null;
 let toolsFailed = false;
@@ -166,53 +183,12 @@ async function loadDefineTool(): Promise<DefineToolFn | null> {
   if (toolsFailed) return null;
   try {
     const mod = await import('@deepseek-ai/dsh-tools');
-    defineToolFn = mod.defineTool as DefineToolFn;
+    defineToolFn = mod.defineTool as unknown as DefineToolFn;
     return defineToolFn;
   } catch {
     toolsFailed = true;
     return null;
   }
-}
-
-// ── SSH helpers (receive an already-connected client) ───────────────────────
-
-function sshExec(client: { exec: (cmd: string, cb: (err: Error | undefined, stream: { on: (e: string, cb: (d: { toString(): string }) => void) => void; stderr: { on: (e: string, cb: (d: { toString(): string }) => void) => void } }) => void) => void; end: () => void }, command: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { client.end(); reject(new Error('ssh-exec timeout')); }, timeoutMs);
-    client.exec(command, (err, stream) => {
-      if (err) { clearTimeout(timer); return reject(err); }
-      let stdout = '', stderr = '';
-      stream.on('data', (d) => { stdout += d.toString(); });
-      stream.stderr.on('data', (d) => { stderr += d.toString(); });
-      // ssh2 streams close with an exit-code 'close' event carrying the code
-      (stream as unknown as { on: (e: string, cb: (code: number) => void) => void }).on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, exitCode: code }); });
-      (stream as unknown as { on: (e: string, cb: (e: Error) => void) => void }).on('error', (e) => { clearTimeout(timer); reject(e); });
-    });
-  });
-}
-
-function sshRead(client: { sftp: (cb: (err: Error | undefined, sftp: { readFile: (p: string, enc: string, cb: (err: Error | undefined, content: Buffer | string) => void) => void }) => void) => void }, remotePath: string): Promise<{ content: string; path: string }> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
-      sftp.readFile(remotePath, 'utf8', (err, content) => {
-        if (err) return reject(err);
-        resolve({ content: typeof content === 'string' ? content : content.toString('utf8'), path: remotePath });
-      });
-    });
-  });
-}
-
-function sshWrite(client: { sftp: (cb: (err: Error | undefined, sftp: { writeFile: (p: string, content: string, cb: (err: Error | undefined) => void) => void }) => void) => void }, remotePath: string, content: string): Promise<{ success: boolean; path: string }> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
-      sftp.writeFile(remotePath, content, (err) => {
-        if (err) return reject(err);
-        resolve({ success: true, path: remotePath });
-      });
-    });
-  });
 }
 
 // ── Tool output helper ───────────────────────────────────────────────────────
@@ -224,19 +200,84 @@ function jsonOutput(schema: Record<string, unknown>) {
   };
 }
 
+// ── Remote UI route (browser ⇄ host) ─────────────────────────────────────────
+
+interface WebRouteLike {
+  kind: 'exact' | 'prefix';
+  path: string;
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+}
+interface WebServerLike {
+  register(route: WebRouteLike): () => void;
+}
+interface HostContextLike {
+  logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
+  on: (event: string, fn: (payload: never, next: (() => Promise<unknown>) | undefined) => unknown) => () => void;
+  effect: (fn: () => () => void | Promise<void>) => void;
+  get?: (name: string) => unknown;
+  agents?: { list?: () => AgentScope[] };
+}
+
+const ROUTE_PREFIX = '/remote-ssh';
+const MAX_BODY_BYTES = 64 * 1024;
+
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8').trim();
+      if (!text) return resolve({});
+      try {
+        const parsed = JSON.parse(text) as unknown;
+        resolve(typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : {});
+      } catch (e) {
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res: ServerResponse, status: number, value: unknown): void {
+  const body = JSON.stringify(value);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(body);
+}
+
+/**
+ * Only the loopback GUI may drive SSH configuration. The desktop carrier binds
+ * 127.0.0.1, so a request whose Host is not loopback, or whose Origin is not the
+ * same origin, is treated as cross-site and refused.
+ */
+function sameOrigin(req: IncomingMessage): boolean {
+  const host = (req.headers.host ?? '').toLowerCase();
+  const hostname = host.startsWith('[') ? host.slice(1, host.indexOf(']')) : host.split(':')[0];
+  if (!(hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1')) return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    return new URL(origin).host.toLowerCase() === host;
+  } catch {
+    return false;
+  }
+}
+
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
-export function apply(
-  ctx: {
-    logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
-    on: (event: string, fn: (payload: never, next: (() => Promise<unknown>) | undefined) => unknown) => () => void;
-    effect: (fn: () => () => void | Promise<void>) => void;
-  },
-  config: ConfigSchema = {},
-): void {
+export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
   const resolved = resolveConfig(config);
   ctx.logger.info(
-    'retry-llm-plugin: activated (mode: %s, maxRetries: %d, ssh: %s:%d)',
+    'retry-llm-plugin: activated (mode: %s, maxRetries: %d, default ssh: %s:%d)',
     resolved.mode, resolved.maxRetries, resolved.ssh.host, resolved.ssh.port,
   );
 
@@ -245,17 +286,155 @@ export function apply(
   const active = new Set<Promise<unknown>>();
   const states = new WeakMap<object, { turn: number; step: number; counts: Map<string, number> }>();
 
-  // SSH connection (lazy, cached)
-  let sshConn: Promise<unknown> | null = null;
-  function getSshClient(): Promise<unknown> {
-    if (!sshConn) {
-      sshConn = (async () => {
-        const client = await loadSsh2Client();
-        if (!client) throw new Error('ssh2 is not available');
-        return client;
-      })();
+  // ── Credentials (SSH passwords live in DSH's credential store) ──────────
+
+  interface CredentialsLike {
+    resolve(ref: string): Promise<{ value: string; source?: string } | undefined>;
+    describe(ref: string): Promise<{ configured: boolean; writable: boolean; source?: string }>;
+    set(ref: string, value: string): Promise<void>;
+    unset(ref: string): Promise<void>;
+  }
+
+  const credentials = (): CredentialsLike | undefined => ctx.get?.('credentials') as CredentialsLike | undefined;
+
+  /** A stable environment-variable-shaped credential reference for one target. */
+  function autoRef(id: string): string {
+    return `REMOTE_SSH_${id.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_PASSWORD`;
+  }
+
+  /**
+   * Resolve the password for one target: a one-off password wins, then the
+   * named reference through the credential service (process environment,
+   * provider store, and .env files), then a plain environment lookup.
+   */
+  async function passwordFor(cfg: SshConfig): Promise<string> {
+    if (cfg.password) return cfg.password;
+    const ref = (cfg.passwordEnv ?? '').trim();
+    if (!ref) return '';
+    const store = credentials();
+    if (store) {
+      try {
+        const resolved = await store.resolve(ref);
+        if (resolved?.value) return resolved.value;
+      } catch { /* fall through to the environment */ }
     }
-    return sshConn;
+    return process.env[ref] ?? '';
+  }
+
+  /**
+   * Read back the saved password of one target for the operator's own view.
+   * The value only leaves the Host through the loopback, same-origin,
+   * cookie-authenticated route below.
+   */
+  async function revealPassword(target: SshTarget): Promise<{ password: string; ref: string; source: string }> {
+    const ref = (target.passwordEnv ?? '').trim();
+    if (!ref) throw new Error('该目标没有保存密码（未设置密码引用）');
+    const store = credentials();
+    let value = '';
+    let source = '';
+    if (store) {
+      try {
+        const resolved = await store.resolve(ref);
+        if (resolved?.value) { value = resolved.value; source = resolved.source ?? 'credential store'; }
+      } catch { /* fall through to the environment */ }
+    }
+    if (!value) {
+      const fromEnv = process.env[ref];
+      if (fromEnv) { value = fromEnv; source = 'process environment'; }
+    }
+    if (!value) throw new Error(`凭据 ${ref} 未配置（既不在 DSH 凭据库，也不在环境变量里）`);
+    return { password: value, ref, source };
+  }
+
+  /** Target views plus whether their named credential is configured. */
+  async function describeAll(store: TargetStoreFile) {
+    const creds = credentials();
+    return Promise.all(store.targets.map(async (target) => {
+      const base = describeTarget(target);
+      if (!target.passwordEnv || !creds) return { ...base, hasStoredPassword: false, passwordWritable: true };
+      try {
+        const info = await creds.describe(target.passwordEnv);
+        return { ...base, hasStoredPassword: info.configured, passwordWritable: info.writable };
+      } catch {
+        return { ...base, hasStoredPassword: false, passwordWritable: true };
+      }
+    }));
+  }
+
+  // ── SSH connection pool (one live connection per target) ────────────────
+
+  const connections = new Map<string, Promise<SshClientLike>>();
+  /** Whether the browser-facing HTTP route is registered (surfaced by `ssh-targets list`). */
+  let routeRegistered = false;
+
+  function connectionFor(key: string, cfg: SshConfig, password: string): Promise<SshClientLike> {
+    const existing = connections.get(key);
+    if (existing) return existing;
+    const pending = (async () => {
+      const Ctor = await loadSsh2ClientCtor();
+      if (!Ctor) throw new Error('ssh2 不可用：插件目录缺少 node_modules，请先在该目录运行 pnpm install');
+      return connectSsh(Ctor, cfg, password);
+    })();
+    connections.set(key, pending);
+    void pending.catch(() => {
+      if (connections.get(key) === pending) connections.delete(key);
+    });
+    return pending;
+  }
+
+  function dropConnection(key: string): void {
+    const pending = connections.get(key);
+    connections.delete(key);
+    if (pending) {
+      void pending.then(
+        (client) => { try { client.end(); } catch { /* already closed */ } },
+        () => { /* never connected */ },
+      );
+    }
+  }
+
+  /** Which connection a call uses: an explicit target, else the default, else plugin config. */
+  function resolveTarget(ref?: string): { key: string; label: string; config: SshConfig; store: TargetStoreFile } {
+    const store = loadStore();
+    const wanted = (ref ?? '').trim() || store.defaultId;
+    if (wanted) {
+      const target = findTarget(store, wanted);
+      if (!target) {
+        const known = store.targets.map((t) => t.id).join(', ') || '(无)';
+        throw new Error(`未知的 SSH 目标 "${wanted}"；已保存的目标：${known}`);
+      }
+      return { key: `target:${target.id}`, label: target.name, config: toSshConfig(target), store };
+    }
+    return { key: 'config', label: `${resolved.ssh.host}:${resolved.ssh.port}`, config: resolved.ssh, store };
+  }
+
+  async function withSshClient<T>(ref: string | undefined, run: (client: SshClientLike, cfg: SshConfig) => Promise<T>): Promise<T> {
+    const { key, config } = resolveTarget(ref);
+    return withSshConfig(config, key, (client) => run(client, config));
+  }
+
+  /** Connect for an explicitly built configuration, reusing one connection per key. */
+  async function withSshConfig<T>(config: SshConfig, key: string, run: (client: SshClientLike) => Promise<T>): Promise<T> {
+    try {
+      return await run(await connectionFor(key, config, await passwordFor(config)));
+    } catch (error) {
+      dropConnection(key);
+      throw error;
+    }
+  }
+
+  /** One-off overrides on top of a target (or the plugin config), used by test/listDir. */
+  function overrideConfig(base: SshConfig, input: TargetInput & { password?: string }): SshConfig {
+    return {
+      ...base,
+      host: (input.host ?? base.host).trim() || base.host,
+      port: Number.isFinite(input.port) ? Number(input.port) : base.port,
+      username: input.username !== undefined ? String(input.username).trim() : base.username,
+      identityFile: input.identityFile !== undefined ? String(input.identityFile).trim() : base.identityFile,
+      passwordEnv: input.passwordEnv !== undefined ? String(input.passwordEnv).trim() : (base.passwordEnv ?? ''),
+      password: typeof input.password === 'string' ? input.password : '',
+      remoteDir: input.remoteDir !== undefined ? String(input.remoteDir).trim() : base.remoteDir,
+    };
   }
 
   // ── Retry listener ───────────────────────────────────────────────────────
@@ -326,9 +505,10 @@ export function apply(
     return { kind: 'retry' };
   }
 
-  const disposeListener = ctx.on('agent/request-error', (payload: RequestErrorPayload, next: () => Promise<unknown>) => {
+  const disposeListener = ctx.on('agent/request-error', (payload: RequestErrorPayload, next: (() => Promise<unknown>) | undefined) => {
     if (lifetime.signal.aborted) return Promise.resolve(undefined);
-    const tracked = recover(payload, next);
+    const delegate = next ?? (() => Promise.resolve(undefined));
+    const tracked = recover(payload, delegate);
     active.add(tracked);
     tracked.finally(() => active.delete(tracked));
     return tracked;
@@ -338,49 +518,78 @@ export function apply(
 
   const agentToolDisposers = new Map<object, Array<() => void>>();
 
-  async function registerSshTools(agent: {
-    ctx: { tools: { register: (tool: unknown) => () => void } };
-  }): Promise<void> {
+  async function registerSshTools(agent: AgentScope): Promise<void> {
+    if (agentToolDisposers.has(agent)) return;
     const defineTool = await loadDefineTool();
     if (!defineTool) {
       ctx.logger.warn('retry-llm-plugin: @deepseek-ai/dsh-tools unavailable, SSH tools disabled');
       return;
     }
+    const targetParam = { type: 'string', description: '已保存的 SSH 目标 id 或名称；省略则用默认目标（再退回插件配置里的 ssh.*）。' };
     const disposers: Array<() => void> = [];
     try {
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-exec',
-        description: 'Execute a shell command on the remote SSH server and return stdout, stderr, and exit code.',
+        description: 'Execute a shell command over SSH and return stdout, stderr, and exit code. Runs in the remote working directory of the selected target.',
         parameters: {
           command: { type: 'string', required: true, description: 'Shell command to execute on the remote server.' },
           timeoutMs: { type: 'number', description: 'Timeout in milliseconds. Defaults to 30000.' },
+          target: targetParam,
         },
         output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
-        execute: (args: { command: string; timeoutMs?: number }) =>
-          getSshClient().then((c) => sshExec(c as never, args.command, args.timeoutMs ?? 30000)),
+        execute: (args: { command: string; timeoutMs?: number; target?: string }) =>
+          withSshClient(args.target, (c, cfg) => sshExec(c, args.command, args.timeoutMs ?? 30000, cfg.remoteDir)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-read',
-        description: 'Read a file from the remote SSH server.',
+        description: 'Read a file over SSH (SFTP). Relative paths resolve against the target remote working directory.',
         parameters: {
           path: { type: 'string', required: true, description: 'Remote file path to read.' },
+          target: targetParam,
         },
         output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
-        execute: (args: { path: string }) =>
-          getSshClient().then((c) => sshRead(c as never, args.path)),
+        execute: (args: { path: string; target?: string }) =>
+          withSshClient(args.target, (c, cfg) => sshRead(c, args.path, cfg.remoteDir)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
         name: 'ssh-write',
-        description: 'Write content to a file on the remote SSH server.',
+        description: 'Write a file over SSH (SFTP). Relative paths resolve against the target remote working directory.',
         parameters: {
           path: { type: 'string', required: true, description: 'Remote file path to write.' },
           content: { type: 'string', required: true, description: 'Content to write to the file.' },
+          target: targetParam,
         },
         output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
-        execute: (args: { path: string; content: string }) =>
-          getSshClient().then((c) => sshWrite(c as never, args.path, args.content)),
+        execute: (args: { path: string; content: string; target?: string }) =>
+          withSshClient(args.target, (c, cfg) => sshWrite(c, args.path, args.content, cfg.remoteDir)),
+      })));
+
+      disposers.push(agent.ctx.tools.register(defineTool({
+        name: 'ssh-targets',
+        description: 'Manage saved SSH development targets (the "remote workspaces" configured on the settings page): list them, test connectivity, save or update one, remove one, or choose the default.',
+        parameters: {
+          action: { type: 'string', required: true, enum: ['list', 'test', 'save', 'remove', 'default', 'reveal', 'listDir'], description: 'Operation to perform. reveal returns a saved password in plaintext; listDir browses a remote directory.' },
+          path: { type: 'string', description: 'Remote directory to list (listDir); empty starts at the target remote directory, then $HOME.' },
+          target: { type: 'string', description: 'Target id or name: required for test/remove/default, optional for save (omit to create a new one).' },
+          name: { type: 'string', description: 'Display name (save).' },
+          host: { type: 'string', description: 'SSH hostname or IP (save).' },
+          port: { type: 'number', description: 'SSH port, default 22 (save).' },
+          username: { type: 'string', description: 'SSH username (save).' },
+          identityFile: { type: 'string', description: 'Private key path, ~ is expanded (save).' },
+          passwordEnv: { type: 'string', description: 'Credential reference (environment-variable name) for this target\'s password (save).' },
+          password: { type: 'string', description: 'Password for password auth: used by test, and stored in the DSH credential store on save (save/test).' },
+          remoteDir: { type: 'string', description: 'Remote working directory (save).' },
+        },
+        output: jsonOutput({ type: 'object', properties: { ok: { type: 'boolean' }, message: { type: 'string' } } }),
+        execute: async (args: Record<string, unknown>) => {
+          const result = await sshTargetsAction(args as never);
+          const revealed = (result as { password?: string; ref?: string; source?: string }).password;
+          const revealLine = revealed ? [`密码（${(result as { ref?: string }).ref}，来源：${(result as { source?: string }).source}）：${revealed}`] : [];
+          const lines = result.targets.map((t) => `- ${t.id}${t.id === result.defaultId ? ' (默认)' : ''}  ${t.name} → ${t.username || '$USER'}@${t.host}:${t.port}${t.remoteDir ? `  dir=${t.remoteDir}` : ''}${t.identityFile ? `  key=${t.identityFile}` : ''}${t.passwordEnv ? `  passwordRef=${t.passwordEnv}${t.hasStoredPassword || t.hasPasswordEnv ? '' : '(未配置)'}` : ''}`);
+          return { ok: result.ok, message: [result.message, ...revealLine, ...lines].join('\n') };
+        },
       })));
     } catch (e) {
       ctx.logger.warn('retry-llm-plugin: failed to register SSH tools for agent: %s', e instanceof Error ? e.message : String(e));
@@ -390,8 +599,128 @@ export function apply(
     agentToolDisposers.set(agent, disposers);
   }
 
+  /** Whether the browser half is in the Host's client-module table (diagnostic). */
+  function clientHalfStatus(): string {
+    const table = ctx.get?.('clientModules') as { clientPath?: (id: string) => string | undefined } | undefined;
+    if (!table?.clientPath) return '不可用（当前组装没有 Web 载体）';
+    const resolved = table.clientPath('dsh-remote-retry-llm-plugin');
+    return resolved ? `已注册（${resolved}）` : '未注册：插件清单是在启动时扫描的，重启 DSH 后刷新页面即可';
+  }
+
+  /** Shared by the `ssh-targets` tool and the Remote UI routes. */
+  async function sshTargetsAction(input: TargetInput & { action?: string; password?: string; storePassword?: boolean }) {
+    const action = (input.action ?? 'list').trim();
+    const store = loadStore();
+    if (action === 'list') {
+      return {
+        ok: true,
+        message: `共 ${store.targets.length} 个目标，默认：${store.defaultId || '(插件配置 ssh.*)'}；设置页（UI）半部：${clientHalfStatus()}；HTTP 路由：${routeRegistered ? `已注册（${ROUTE_PREFIX}）` : '未注册'}`,
+        targets: await describeAll(store),
+        defaultId: store.defaultId,
+      };
+    }
+    if (action === 'test' || action === 'listDir') {
+      // Same resolution as the exec tools: explicit target, else the default, else
+      // plugin config — each field overridable for a one-off call.
+      const ref = (input.target ?? '').trim() || store.defaultId;
+      const target = ref ? findTarget(store, ref) : undefined;
+      if (ref && !target) throw new Error(`未知的 SSH 目标 "${ref}"`);
+      const base: SshConfig = target ? toSshConfig(target) : resolved.ssh;
+      const cfg = overrideConfig(base, input);
+      const key = target ? `target:${target.id}` : `cfg:${cfg.host}:${cfg.port}:${cfg.username}`;
+      if (action === 'test') {
+        const result = await testConnection(cfg, await passwordFor(cfg));
+        return { ok: result.ok, message: result.message, targets: await describeAll(store), defaultId: store.defaultId };
+      }
+      const path = typeof (input as { path?: string }).path === 'string' ? String((input as { path?: string }).path) : '';
+      const listing = await withSshConfig(cfg, key, (client) => sshListDir(client, path, cfg.remoteDir));
+      return { ok: true, message: listing.path, listing, targets: await describeAll(store), defaultId: store.defaultId };
+    }
+    if (action === 'reveal') {
+      const ref = (input.target ?? '').trim();
+      const target = ref ? findTarget(store, ref) : undefined;
+      if (!target) throw new Error(`未知的 SSH 目标 "${ref}"`);
+      const revealed = await revealPassword(target);
+      return { ok: true, message: `目标 "${target.name}" 的密码（引用 ${revealed.ref}）`, ...revealed, targets: await describeAll(store), defaultId: store.defaultId };
+    }
+    if (action === 'save') {
+      const password = typeof input.password === 'string' ? input.password : '';
+      const name = (input.name ?? '').trim() || (input.host ?? '').trim();
+      const editing = Boolean((input.id ?? '').trim() || (input.target ?? '').trim());
+      let id = (input.id ?? '').trim() || slug(name);
+      let reused = '';
+      if (!editing) {
+        // Re-saving the same connection updates that target instead of piling up
+        // duplicates; a genuinely different connection mints a fresh identity so
+        // "添加" can never overwrite an unrelated target.
+        const host = (input.host ?? '').trim();
+        const port = Number.isFinite(input.port) ? Number(input.port) : 22;
+        const username = (input.username ?? '').trim();
+        const identityFile = (input.identityFile ?? '').trim();
+        const remoteDir = (input.remoteDir ?? '').trim();
+        const twin = store.targets.find((t) => t.host === host && t.port === port
+          && t.username === username && t.identityFile === identityFile && t.remoteDir === remoteDir);
+        if (twin) {
+          id = twin.id;
+          reused = `（与已有目标 "${twin.name}" 连接相同，已更新它）`;
+        } else {
+          let candidate = id;
+          for (let n = 2; store.targets.some((t) => t.id === candidate); n += 1) candidate = `${id}-${n}`;
+          id = candidate;
+        }
+      }
+      // A password typed in the UI is stored under this target's credential
+      // reference, so later ssh-exec calls can authenticate without it.
+      const passwordEnv = (input.passwordEnv ?? '').trim() || (password ? autoRef(id) : '');
+      const saved = upsertTarget(store, { ...input, id, passwordEnv });
+      if ((input as { setDefault?: boolean }).setDefault === true) store.defaultId = saved.id;
+      saveStore(store);
+      dropConnection(`target:${saved.id}`);
+      let note = '';
+      const creds = credentials();
+      if (password && creds) {
+        try {
+          await creds.set(passwordEnv, password);
+          note = `，密码已存入 DSH 凭据库（${passwordEnv}）`;
+        } catch (e) {
+          note = `；密码未能存入凭据库（${e instanceof Error ? e.message : String(e)}），可改用环境变量 ${passwordEnv}`;
+        }
+      } else if (password) {
+        note = `；凭据服务不可用，密码未保存（可改用环境变量 ${passwordEnv}）`;
+      }
+      const detail = [
+        `${saved.username || '$USER'}@${saved.host}:${saved.port}`,
+        saved.remoteDir ? `远程目录 ${saved.remoteDir}` : '远程目录未设置',
+        saved.localDir ? `本地目录 ${saved.localDir}` : null,
+        store.defaultId === saved.id ? '已设为默认' : null,
+      ].filter((part) => part !== null).join('，');
+      return { ok: true, message: `已保存目标 "${saved.name}"（${saved.id}）${reused}：${detail}${note}`, targets: await describeAll(store), defaultId: store.defaultId };
+    }
+    if (action === 'remove') {
+      const ref = (input.target ?? '').trim();
+      const target = ref ? findTarget(store, ref) : undefined;
+      if (!target) throw new Error(`未知的 SSH 目标 "${ref}"`);
+      removeTarget(store, target.id);
+      saveStore(store);
+      dropConnection(`target:${target.id}`);
+      if (target.passwordEnv) {
+        try { await credentials()?.unset(target.passwordEnv); } catch { /* keep the deletion result */ }
+      }
+      return { ok: true, message: `已删除目标 "${target.name}"`, targets: await describeAll(store), defaultId: store.defaultId };
+    }
+    if (action === 'default') {
+      const ref = (input.target ?? '').trim();
+      const target = ref ? findTarget(store, ref) : undefined;
+      if (!target) throw new Error(`未知的 SSH 目标 "${ref}"`);
+      store.defaultId = target.id;
+      saveStore(store);
+      return { ok: true, message: `默认目标已设为 "${target.name}"`, targets: await describeAll(store), defaultId: store.defaultId };
+    }
+    throw new Error(`未知的 action "${action}"`);
+  }
+
   const disposeAgentListener = ctx.on('agent/created', (payload: never) => {
-    const agent = (payload as { agent?: { ctx: { tools: { register: (tool: unknown) => () => void } } } }).agent;
+    const agent = (payload as { agent?: AgentScope }).agent;
     if (agent) void registerSshTools(agent);
   });
 
@@ -405,6 +734,120 @@ export function apply(
     }
   });
 
+  // Agents created before this plugin activated never emit `agent/created`, so
+  // register their tools now — otherwise the current session goes without SSH.
+  try {
+    for (const agent of ctx.agents?.list?.() ?? []) void registerSshTools(agent);
+  } catch (e) {
+    ctx.logger.warn('retry-llm-plugin: failed to enumerate existing agents: %s', e instanceof Error ? e.message : String(e));
+  }
+
+  // ── Prompt context: the agent must know which remote host "the server" is ──
+
+  /**
+   * Runtime-context text listing the saved targets. Rendered per assembly, so a
+   * target saved mid-session is visible to the very next model step. Returns an
+   * empty string (contributing nothing) while no target exists.
+   */
+  function renderTargetsContext(): string {
+    const store = loadStore();
+    if (store.targets.length === 0) return '';
+    const lines = store.targets.map((target) => {
+      const isDefault = target.id === store.defaultId;
+      const facts = [
+        `${target.username || '$USER'}@${target.host}:${target.port}`,
+        target.remoteDir ? `remote working directory ${target.remoteDir}` : null,
+        target.identityFile ? `key ${target.identityFile}` : null,
+        target.passwordEnv ? `password credential ${target.passwordEnv}` : null,
+      ].filter((fact) => fact !== null).join(', ');
+      return `- ${target.name}${isDefault ? ' (default)' : ''}: ${facts} [target "${target.id}"]`;
+    });
+    return [
+      'Saved remote SSH workspaces. Use the ssh-exec, ssh-read and ssh-write tools for work on these hosts; omit `target` to use the default one.',
+      ...lines,
+      'Call the ssh-targets tool with action "default" to change the default, or action "list" to see them again.',
+    ].join('\n');
+  }
+
+  interface SystemPromptLike {
+    context(contribution: { name: string; order: number; text: () => string }): () => void;
+  }
+
+  const registerPromptContext = (scope: { systemPrompt?: SystemPromptLike }): void => {
+    const systemPrompt = scope?.systemPrompt;
+    if (typeof systemPrompt?.context !== 'function') return;
+    try {
+      const dispose = systemPrompt.context({ name: 'remote-ssh:targets', order: 130, text: renderTargetsContext });
+      ctx.effect(() => () => dispose());
+      ctx.logger.info('retry-llm-plugin: remote-workspace prompt context registered');
+    } catch (e) {
+      ctx.logger.warn('retry-llm-plugin: failed to register the prompt context: %s', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const injectService = (ctx as unknown as { inject?: (names: string[], callback: (scope: unknown) => void) => void }).inject;
+  const immediateSystemPrompt = ctx.get?.('systemPrompt') as SystemPromptLike | undefined;
+  if (immediateSystemPrompt) registerPromptContext({ systemPrompt: immediateSystemPrompt });
+  else if (typeof injectService === 'function') injectService.call(ctx, ['systemPrompt'], (scope) => registerPromptContext(scope as { systemPrompt?: SystemPromptLike }));
+
+  // ── Remote UI routes (the "远程工作区" page talks to these) ───────────────
+
+  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, message: 'cross-origin request refused' });
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const route = url.pathname.slice(ROUTE_PREFIX.length) || '/';
+      if (req.method === 'GET' && route === '/targets') {
+        const store = loadStore();
+        return sendJson(res, 200, { ok: true, defaultId: store.defaultId, homeDir: homedir(), targets: await describeAll(store) });
+      }
+      if (req.method === 'POST') {
+        const body = await readJsonBody(req);
+        if (route === '/targets') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput & { password?: string; storePassword?: boolean }), action: 'save' }));
+        if (route === '/targets/delete') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput), action: 'remove' }));
+        if (route === '/default') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput), action: 'default' }));
+        if (route === '/reveal') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput), action: 'reveal' }));
+        if (route === '/list-dir') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput & { path?: string }), action: 'listDir' }));
+        // Reuse the tool action so the page and the agent share one resolution
+        // path (explicit target → default → plugin config, plus per-field
+        // overrides and credential resolution).
+        if (route === '/test') return sendJson(res, 200, await sshTargetsAction({ ...(body as TargetInput & { password?: string }), action: 'test' }));
+      }
+      return sendJson(res, 404, { ok: false, message: `unknown route ${route}` });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  /**
+   * Register the browser route. `webServer` is provided by a sibling entry that
+   * may activate after this plugin, so wait for the service the same way the
+   * shipped client-modules carrier does: `ctx.inject([...], carrier)` runs now
+   * when the service already exists and again when it appears.
+   */
+  const registerRoute = (carrier: { webServer?: WebServerLike } | WebServerLike): void => {
+    const webServer = (carrier as { webServer?: WebServerLike }).webServer ?? (carrier as WebServerLike);
+    if (routeRegistered || typeof webServer?.register !== 'function') return;
+    try {
+      const dispose = webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler });
+      routeRegistered = true;
+      ctx.effect(() => () => dispose());
+      ctx.logger.info('retry-llm-plugin: remote-workspace route registered at %s', ROUTE_PREFIX);
+    } catch (e) {
+      ctx.logger.warn('retry-llm-plugin: failed to register the remote-workspace route: %s', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const carrierCtx = ctx as unknown as { inject?: (names: string[], callback: (c: unknown) => void) => void };
+  const immediateWebServer = ctx.get?.('webServer') as WebServerLike | undefined;
+  if (immediateWebServer) {
+    registerRoute(immediateWebServer);
+  } else if (typeof carrierCtx.inject === 'function') {
+    carrierCtx.inject(['webServer'], (webCtx) => registerRoute(webCtx as WebServerLike));
+  } else {
+    ctx.logger.warn('retry-llm-plugin: webServer unavailable, the remote-workspace settings page cannot save targets');
+  }
+
   // ── Disposal ─────────────────────────────────────────────────────────────
 
   ctx.effect(() => async () => {
@@ -416,12 +859,11 @@ export function apply(
     }
     agentToolDisposers.clear();
     lifetime.abort(new Error('retry-llm-plugin disposed'));
-    if (sshConn) {
-      const client = await sshConn.catch(() => null);
-      if (client && typeof (client as { end?: () => void }).end === 'function') {
-        (client as { end: () => void }).end();
-      }
+    for (const pending of connections.values()) {
+      const client = await pending.catch(() => null);
+      if (client) client.end();
     }
+    connections.clear();
     await Promise.allSettled([...active]);
   });
 }

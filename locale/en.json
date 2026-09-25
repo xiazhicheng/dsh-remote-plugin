@@ -1,4 +1,4 @@
 {
-  "title": "LLM Retry Boost",
-  "description": "Retry unstable or rate-limited model requests up to 50 times, or forever in always mode, on the agent/request-error recovery waterfall."
+  "title": "Remote SSH Workspaces + LLM Retry Boost",
+  "description": "SSH remote development (exec/read/write tools, targets configured and connection-tested on the settings page or straight from the add-workspace flow) plus boosted LLM retries on the agent/request-error recovery waterfall."
 }

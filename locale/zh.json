@@ -1,4 +1,4 @@
 {
-  "title": "LLM 重试增强",
-  "description": "在 agent/request-error 恢复瀑布流上将不稳定或被限流的模型请求重试最多 50 次，或 always 模式下持续重试直到成功。"
+  "title": "远程 SSH 工作区 + LLM 重试增强",
+  "description": "SSH 远程开发（exec/read/write 工具；可在设置页或「添加工作区」流程里配置并测试连通后保存目标），并在 agent/request-error 恢复瀑布流上增强 LLM 重试。"
 }
