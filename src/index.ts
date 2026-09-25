@@ -663,16 +663,27 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
       const ref = (input.target ?? '').trim();
       const target = ref ? findTarget(store, ref) : undefined;
       if (!target) throw new Error(`未知的 SSH 目标 "${ref}"`);
+      // An explicit path wins, then the directory the target already remembers,
+      // then the derived per-target directory.
       const requested = typeof input.path === 'string' ? input.path.trim() : '';
-      const dir = requested || `${homedir()}/dsh-remote/${target.id}`;
+      const dir = requested || target.localDir || `${homedir()}/dsh-remote/${target.id}`;
       mkdirSync(dir, { recursive: true });
       if (!statSync(dir).isDirectory()) throw new Error(`${dir} 不是目录`);
+      // One session directory per target: a move releases the previous binding.
+      const previous = boundDirs(store, target.id).filter((bound) => bound !== dir);
+      for (const bound of previous) delete store.bindings[bound];
+      const stolen = store.bindings[dir];
+      const other = stolen !== undefined && stolen !== target.id ? store.targets.find((t) => t.id === stolen) : undefined;
       bindTarget(store, dir, target.id);
       store.targets = store.targets.map((t) => (t.id === target.id ? { ...t, localDir: dir, updatedAt: new Date().toISOString() } : t));
       saveStore(store);
+      const notes = [
+        previous.length > 0 ? `（已从 ${previous.join('、')} 迁走）` : '',
+        other ? `（该目录原绑定「${other.name}」，已改绑到本目标）` : '',
+      ].filter((note) => note !== '').join('');
       return {
         ok: true,
-        message: `会话工作目录已就绪并绑定到「${target.name}」：${dir}`,
+        message: `会话目录已绑定到「${target.name}」：${dir}${notes}`,
         dir,
         targets: await describeAll(store),
         defaultId: store.defaultId,

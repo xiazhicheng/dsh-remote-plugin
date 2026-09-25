@@ -111,7 +111,7 @@ window.__ModuleLoader__.load({
 
 		const EMPTY_FORM = {
 			id: "", target: "", name: "", host: "", port: "22", username: "",
-			identityFile: "", passwordEnv: "", remoteDir: "", password: "",
+			identityFile: "", passwordEnv: "", remoteDir: "", localDir: "", password: "",
 		};
 
 		async function api(path, init) {
@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
 		// closed panel never forces the operator to retype them. The password is
 		// deliberately excluded: it belongs in the credential store, not the page.
 		const DRAFT_KEY = "dsh-remote-ssh-draft";
-		const DRAFT_FIELDS = ["name", "host", "port", "username", "identityFile", "passwordEnv", "remoteDir"];
+		const DRAFT_FIELDS = ["name", "host", "port", "username", "identityFile", "passwordEnv", "remoteDir", "localDir"];
 
 		function readDraft() {
 			try {
@@ -202,7 +202,7 @@ window.__ModuleLoader__.load({
 				name: form.name, host: form.host,
 				port: form.port === "" ? undefined : Number(form.port),
 				username: form.username, identityFile: form.identityFile,
-				passwordEnv: form.passwordEnv, remoteDir: form.remoteDir,
+				passwordEnv: form.passwordEnv, remoteDir: form.remoteDir, localDir: form.localDir,
 			}), [form]);
 
 			const payloadWithPassword = useCallback(() => Object.assign(payload(), {
@@ -415,6 +415,15 @@ window.__ModuleLoader__.load({
 						type: "button", className: "dshSsh_btn", id: "dshSsh-browse",
 						onClick: () => { editor.setBrowsing(true); void editor.browseRemote(editor.form.remoteDir || ""); },
 					}, "浏览远端…")),
+				h("label", { className: "dshSsh_label", htmlFor: "dshSsh-sessionDir" }, "会话目录"),
+				h("div", { className: "dshSsh_inputRow" },
+					h("input", {
+						id: "dshSsh-sessionDir", className: "dshSsh_input", type: "text",
+						placeholder: "留空则自动用 ~/dsh-remote/<目标id>；也可选你自己的目录",
+						value: editor.form.localDir,
+						onChange: (event) => editor.change("localDir", event.target.value),
+					}),
+					h("button", { type: "button", className: "dshSsh_btn", id: "dshSsh-pickSessionDir", onClick: () => void editor.pickLocal() }, "选择…")),
 
 				h("label", { className: "dshSsh_label", htmlFor: "dshSsh-password" }, "密码"),
 				h("div", { className: "dshSsh_inputRow" },
@@ -469,6 +478,7 @@ window.__ModuleLoader__.load({
 			const [defaultId, setDefaultId] = useState("");
 			const [revealed, setRevealed] = useState({});
 			const [listError, setListError] = useState("");
+			const [notice, setNotice] = useState("");
 			const editor = useTargetEditor();
 			const armed = useRef(false);
 			const alive = useRef(true);
@@ -496,6 +506,7 @@ window.__ModuleLoader__.load({
 					setMode("choose");
 					setRevealed({});
 					setListError("");
+					setNotice("");
 					editor.start(null);
 					return;
 				}
@@ -533,7 +544,7 @@ window.__ModuleLoader__.load({
 					setDefaultId(target.id);
 					// One session workspace per target, so a session resolves its own
 					// host through the binding instead of the global default.
-					const dir = target.localDir || await prepareTargetDir(target.id);
+					const dir = await prepareTargetDir(target.id);
 					if (!dir) throw new Error("无法确定会话工作目录");
 					try {
 						await ensureRemoteWorkspace(dir, target.name, target.host);
@@ -541,6 +552,20 @@ window.__ModuleLoader__.load({
 					resolveOutcome(dir);
 				} catch (e) {
 					setListError(`打开失败：${errorText(e)}`);
+				}
+			};
+
+			/** Re-bind one target's session directory to a directory you pick. */
+			const changeSessionDir = async (target) => {
+				setListError(""); setNotice("");
+				try {
+					const path = await pickLocalDirectory();
+					if (!path) return;
+					const data = await api("/prepare-dir", { method: "POST", body: JSON.stringify({ target: target.id, path }) });
+					setNotice(data.message || `会话目录：${path}`);
+					await loadTargets();
+				} catch (e) {
+					setListError(`设置会话目录失败：${errorText(e)}`);
 				}
 			};
 
@@ -610,6 +635,7 @@ window.__ModuleLoader__.load({
 			const listPanel = h(React.Fragment, null,
 				h("p", { className: "dshSsh_hint" }, "已保存的远程工作区：点「打开」直接进入（会设为默认），也可以编辑或删除。"),
 				listError ? h("div", { className: "dshSsh_err" }, listError) : null,
+				notice ? h("div", { className: "dshSsh_ok" }, notice) : null,
 				targets.length === 0
 					? h("p", { className: "dshSsh_hint" }, "还没有保存过远程工作区，先新建一个。")
 					: h("ul", { className: "dshSsh_list" }, targets.map((target) => {
@@ -624,6 +650,7 @@ window.__ModuleLoader__.load({
 									? h("button", { type: "button", className: "dshSsh_btn", onClick: () => void toggleReveal(target) },
 										secret ? "隐藏密码" : "显示密码")
 									: null,
+								h("button", { type: "button", className: "dshSsh_btn", onClick: () => void changeSessionDir(target) }, "会话目录…"),
 								h("button", { type: "button", className: "dshSsh_btn dshSsh_primary", onClick: () => void openTarget(target) }, "打开"),
 								h("button", { type: "button", className: "dshSsh_btn", onClick: () => { editor.start(target); setMode("form"); } }, "编辑"),
 								h("button", { type: "button", className: "dshSsh_btn", onClick: () => void removeTarget(target) }, "删除")),
@@ -646,7 +673,7 @@ window.__ModuleLoader__.load({
 				TargetForm({ editor }),
 				h("div", { className: "dshSsh_hint" },
 					"「远程目录」是**远程机器上的**工作目录，命令都在那里执行（可直接输入路径，或点「浏览远端…」选择）。"
-					+ "保存后会立即设为默认，自动创建并绑定一个专属会话目录（`~/dsh-remote/目标id`），"
+					+ "保存后会立即设为默认，自动创建并绑定一个专属会话目录（`~/dsh-remote/目标id`，也可用下面「会话目录」改成你自己的目录），"
 					+ "并在侧边栏生成/打开一个名为「远程 · 名称 (主机)」的工作区——之后该会话里的 ssh 工具就认这台机器。"),
 				Messages({ error: editor.error, okText: editor.okText }),
 				h("div", { className: "dshSsh_actions" },

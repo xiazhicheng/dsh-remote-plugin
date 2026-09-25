@@ -105,7 +105,7 @@ Every target with a saved password has a **显示密码 (reveal)** button: the p
 
 Resolution order: tool `target` argument → **the target bound to the session's workspace** → the default target → the plugin config `ssh.*`.
 
-**Per-workspace binding**: opening a target gives it its own session directory `~/dsh-remote/<target id>` (created and bound by the host; point it at your own directory if you prefer). Each `远程 · <name>` workspace is therefore bound to its own host — even after the default target changes, a session opened in the 财经 workspace keeps talking to 财经. Deleting a target releases its bindings but leaves the directory on disk.
+**Per-workspace binding**: opening a target gives it its own session directory `~/dsh-remote/<target id>`, created and bound by the host. To change it, click **会话目录…** on the target's row, or use the **会话目录** field of the new/edit form (empty derives it). A target keeps exactly one session directory — moving it releases the old binding, and taking over a directory that belonged to another target is reported explicitly. Each `远程 · <name>` workspace is therefore bound to its own host — even after the default target changes, a session opened in the 财经 workspace keeps talking to 财经. Deleting a target releases its bindings but leaves the directory on disk.
 
 Targets and bindings live in `remote-ssh-targets.json` in the profile directory (0600); the file holds no password — a saved password lives in DSH's credential store under the target's reference.
 
